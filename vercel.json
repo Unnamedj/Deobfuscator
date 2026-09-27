@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/deobfuscate.py": {
+      "maxDuration": 60
+    }
+  }
+}

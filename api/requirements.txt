@@ -1,0 +1,4 @@
+# The API handler uses only the Python standard library (json, os, re,
+# time, traceback, urllib.request, http.server) so no third-party
+# dependencies are required. Add your real deobf/deob.py's dependencies
+# here once it's wired in.
