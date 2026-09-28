@@ -22,8 +22,10 @@ def _load_dotenv(path):
 
 _load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-from fastapi import FastAPI, HTTPException  # noqa: E402
-from fastapi.responses import PlainTextResponse  # noqa: E402
+import hashlib  # noqa: E402
+
+from fastapi import FastAPI, HTTPException, Request  # noqa: E402
+from fastapi.responses import HTMLResponse, PlainTextResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
@@ -32,6 +34,39 @@ from . import discord, jobs  # noqa: E402
 app = FastAPI(title="Luau Deobfuscator", docs_url=None, redoc_url=None)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _asset_version():
+    h = hashlib.sha1()
+    for root, _, files in sorted(os.walk(STATIC_DIR)):
+        for name in sorted(files):
+            with open(os.path.join(root, name), "rb") as f:
+                h.update(name.encode() + f.read())
+    return h.hexdigest()[:10]
+
+
+# index.html references every asset as ?v=__V__: a deploy changes the URLs, so
+# browsers (iOS Safari especially) can never pair new HTML with stale CSS/JS.
+ASSET_VERSION = _asset_version()
+with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as _f:
+    INDEX_HTML = _f.read().replace("__V__", ASSET_VERSION)
+
+
+@app.middleware("http")
+async def cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if "cache-control" not in response.headers:
+        if request.query_params.get("v") == ASSET_VERSION:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/index.html", response_class=HTMLResponse, include_in_schema=False)
+def index():
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
 SAMPLES_DIR = os.path.join(jobs.REPO_ROOT, "samples")
 SAMPLE_LABELS = {"-obfuscated.lua": "Luraph v15", "-ib1.lua": "IronBrew 1"}
 
