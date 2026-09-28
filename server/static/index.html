@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Luau Deobfuscator</title>
+    <meta
+      name="description"
+      content="Deofuscador de scripts Luau/Lua para uso educativo — sube un script, elige el ofuscador y obtén el código legible."
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%93%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1><span>🔓</span> Luau Deobfuscator</h1>
+        <p>
+          Herramienta educativa para analizar y limpiar scripts Lua/Luau
+          ofuscados. El motor ejecuta el script en una VM real de Luau contra
+          un entorno simulado de Roblox y reconstruye el código legible.
+        </p>
+        <div class="banner" id="engine-banner">
+          ⚠️ Motor no disponible en el servidor — revisa el deploy (falta
+          <code>deobf/bin/luau</code>).
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="row-between">
+          <label class="field-label" id="filename-label">Script (script.lua)</label>
+          <div>
+            <button class="upload-btn" id="upload-btn" type="button">Subir archivo…</button>
+            <input type="file" id="file-input" accept=".lua,.luau,.txt" hidden />
+          </div>
+        </div>
+        <textarea id="source" placeholder="Pega aquí el script ofuscado…" spellcheck="false"></textarea>
+
+        <div class="controls">
+          <div>
+            <label class="field-label">Ofuscador</label>
+            <select id="obfuscator">
+              <option value="auto-detect">auto-detect</option>
+              <option value="luraph_v15">luraph_v15</option>
+              <option value="ironbrew1">ironbrew1</option>
+              <option value="generic">generic</option>
+            </select>
+          </div>
+
+          <div class="checkbox-row">
+            <input type="checkbox" id="no-devirt" />
+            <label for="no-devirt">Modo rápido (trace, sin devirtualizar)</label>
+          </div>
+
+          <div>
+            <label class="field-label">Timeout script (s)</label>
+            <input type="number" id="timeout" min="10" max="900" value="90" />
+          </div>
+
+          <span class="status-pill" id="status-pill">Listo.</span>
+        </div>
+
+        <div class="actions">
+          <button class="primary" id="run-btn">Deofuscar</button>
+          <button id="detect-btn">Solo detectar</button>
+          <button id="download-btn" disabled>Descargar salida</button>
+          <button id="copy-btn" disabled>Copiar</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="output">Salida</button>
+          <button class="tab-btn" data-tab="log">Registro</button>
+        </div>
+        <pre class="output" id="output-pane">// El código deofuscado aparecerá aquí.</pre>
+        <pre class="output wrap" id="log-pane" style="display: none">// El registro de la ejecución aparecerá aquí.</pre>
+      </section>
+
+      <footer>
+        Cada trabajo notifica inicio, fin y estado a un webhook de Discord
+        (configurado por variable de entorno del servidor). La devirtualización
+        completa de scripts grandes puede tardar varios minutos — no cierres
+        esta pestaña. Uso educativo / de investigación únicamente.
+      </footer>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

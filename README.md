@@ -1,88 +1,105 @@
-# Luau Deobfuscator — Web
+# Luau Deobfuscator — Web (Render)
 
-Versión web (Next.js + función serverless en Python) del deobfuscador de
-escritorio (`deobf_gui.pyw`), pensada para desplegarse en Vercel con
-notificaciones de estado a Discord.
+Interfaz web para `deobf/deob.py`: un deobfuscador **dinámico** de scripts
+Roblox Luau. El script protegido corre en una VM real de Luau contra un
+entorno simulado de Roblox (`deobf/envlog.luau`), se traza su
+comportamiento y, para Luraph v15 / IronBrew1, se devirtualiza el bytecode
+de vuelta a Luau legible con control de flujo real.
 
-## Estructura
+## Por qué Render y no Vercel
+
+El motor necesita:
+
+- un **binario nativo `luau`** (compilado desde el código fuente de Luau,
+  con un patch específico — no un build estándar descargado),
+- correr como **subproceso independiente por cada trabajo** (mantiene
+  estado global entre corridas, ver `CLAUDE.md`),
+- y puede tardar **de segundos a 15+ minutos** en scripts grandes con
+  devirtualización completa.
+
+Nada de eso cabe en una función serverless de Vercel (límite duro de
+minutos, sin binarios nativos persistentes). Render corre esto como un
+**Web Service Docker** de larga duración, sin esas limitaciones.
+
+## Arquitectura
 
 ```
-app/                    UI en Next.js (React + Tailwind)
-api/deobfuscate.py      Función serverless (Python) que ejecuta el job y notifica a Discord
-deobf/deob.py           Punto de conexión del motor real de deofuscación (placeholder)
-vercel.json             Config de Vercel (duración máx. de la función)
+Dockerfile              build multi-stage: compila luau/luau-ast, arma la imagen final
+docker/build_luau_ast.py  compila deobf/bin/luau-ast (deob.py usa build_luau.py para `luau`)
+deobf/                   el motor real (tal cual se recibió; deobf/bin/*.exe se compilan en el build)
+server/
+  app.py                 FastAPI: /api/health, /api/jobs (POST), /api/jobs/{id} (GET), sirve el frontend
+  jobs.py                job runner asíncrono: corre deob.py como subprocess en un hilo, con timeout duro
+  discord.py              notificaciones de inicio/fin/error a un webhook de Discord
+  static/                 frontend (HTML/CSS/JS vanilla, sin build step)
+render.yaml              Blueprint de Render (Web Service, runtime docker)
+samples/                  scripts de prueba (con y sin ofuscar) que trae el propio proyecto
 ```
 
-## ⚠️ Falta conectar el motor real
-
-Lo que me compartiste (`deobf_gui.pyw`) es solo la GUI de escritorio: llama
-a `deobf/deob.py` como subproceso, pero ese archivo (con el paquete
-`deobf/` completo: detección de ofuscador, devirtualización, etc.) no
-estaba incluido.
-
-Mientras tanto, `api/deobfuscate.py` usa una **transformación de
-demostración** (decodifica escapes simples, reindenta por bloques) y lo
-deja bien claro en la UI y en el log de cada corrida — **no es
-deofuscación real**.
-
-Para conectar el motor real:
-
-1. Copia tu `deob.py` (y cualquier módulo que use) dentro de `deobf/`,
-   reemplazando el `deobf/deob.py` placeholder.
-2. Implementa la función `run(source, obfuscator, no_devirt, timeout)` con
-   la firma y el `dict` de retorno que ya documenta ese archivo
-   (`output`, `log`, `detected_obfuscator`).
-3. Listo — `api/deobfuscate.py` lo detecta e importa automáticamente, sin
-   tocar nada más. La UI deja de mostrar el aviso de "motor no conectado".
+**Flujo de un trabajo:** `POST /api/jobs` crea el job y responde al toque
+con un `id` (no bloquea la request); un hilo en background corre
+`python deobf/deob.py <script> ...` como subproceso; el frontend hace
+`GET /api/jobs/{id}` cada 1.5s mostrando log y estado en vivo hasta que
+termina. Discord recibe un webhook al iniciar y al terminar (éxito o
+error).
 
 ## Desarrollo local
 
-```bash
-npm install
-npm run dev
-```
-
-La función Python (`api/deobfuscate.py`) solo corre bajo el runtime de
-Vercel. Para probarla localmente con el mismo comportamiento de
-producción usa la CLI de Vercel:
+Necesitas Python 3.11+ y, para deofuscar de verdad (no solo servir la UI),
+el binario `luau` compilado:
 
 ```bash
-npm i -g vercel
-vercel dev
+python3 deobf/build_luau.py --portable   # compila deobf/bin/luau (necesita git, cmake, g++)
+python3 docker/build_luau_ast.py --portable   # compila deobf/bin/luau-ast (opcional, solo para checks)
+
+pip install -r server/requirements.txt
+uvicorn server.app:app --reload --port 8000
+# abre http://localhost:8000
 ```
+
+Sin `deobf/bin/luau`, la UI carga igual pero el banner de "motor no
+disponible" se muestra y cualquier trabajo falla.
 
 ## Variables de entorno
 
-Copia `.env.example` a `.env.local` (local) o configúralas en **Vercel →
-Project → Settings → Environment Variables** (producción):
-
 | Variable              | Descripción                                                        |
 | ---------------------- | ------------------------------------------------------------------- |
-| `DISCORD_WEBHOOK_URL`  | Webhook de Discord. Se notifica inicio, fin (éxito) y fin (error). |
+| `DISCORD_WEBHOOK_URL`  | Webhook de Discord. Notifica inicio, fin (éxito) y fin (error) de cada trabajo. Vacío = sin notificaciones. |
+| `PORT`                 | Puerto donde escucha uvicorn (Render lo inyecta solo). Default 8000 local. |
 
-Si la dejas vacía, la app funciona igual pero sin notificar a Discord.
+Copia `.env.example` a `.env` para desarrollo local si usas un cargador de
+env vars, o expórtalas directo en la shell.
 
-## Deploy en Vercel
+## Deploy en Render
 
-```bash
-vercel        # preview
-vercel --prod # producción
-```
+1. Conecta el repo en [render.com](https://render.com) → **New → Blueprint**
+   y apunta a este repo (usa `render.yaml`), o crea un **Web Service**
+   manual con **Runtime: Docker** y este `Dockerfile`.
+2. En **Environment**, agrega `DISCORD_WEBHOOK_URL` con la URL de tu
+   webhook de Discord (Server Settings → Integrations → Webhooks →
+   New Webhook → Copy URL).
+3. Deploy. El build compila `luau`/`luau-ast` desde código fuente (tarda
+   varios minutos la primera vez); el health check pega a `/api/health`.
 
-O conecta el repo desde el dashboard de Vercel (detecta Next.js
-automáticamente; la función Python en `api/` se despliega sola gracias a
-`api/requirements.txt`). No olvides configurar `DISCORD_WEBHOOK_URL` en
-las Environment Variables del proyecto antes del primer deploy en
-producción.
+**Plan free de Render:** el servicio se duerme tras inactividad y tarda
+unos segundos en despertar en la siguiente request — normal, no es un
+error. Para scripts grandes con devirtualización completa (varios
+minutos), considera un plan pago para evitar que el servicio se duerma
+a mitad de un trabajo largo.
 
-**Nota sobre límites:** `vercel.json` pide 60s de `maxDuration` para
-`api/deobfuscate.py`. En el plan Hobby de Vercel el máximo permitido puede
-ser menor; si tus scripts tardan más, considera subir de plan o recortar
-el timeout que expone la UI.
+## Límites conocidos
+
+- El detector de ofuscadores solo reconoce `luraph_v15` e `ironbrew1`;
+  todo lo demás cae al modo `generic` (solo trace de comportamiento, sin
+  devirtualización).
+- El trace no captura ramas no ejecutadas durante la corrida real.
+- Un kill switch del servidor mata cualquier trabajo que exceda 20
+  minutos (`server/jobs.py`, `HARD_KILL_SECONDS`), para que un job
+  colgado no tumbe el servicio.
 
 ## Uso previsto
 
-Herramienta educativa para el ámbito estudiantil: analizar y entender
-técnicas de ofuscación en scripts Lua/Luau. No está pensada para eludir
-protecciones en sistemas que no te pertenecen ni tienes autorización para
-analizar.
+Herramienta educativa / de investigación para el ámbito estudiantil:
+entender técnicas de ofuscación en scripts Lua/Luau. No está pensada para
+eludir protecciones en sistemas que no te pertenecen ni tienes
+autorización para analizar.

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: luau-deobfuscator
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false

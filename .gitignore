@@ -1,10 +1,10 @@
-node_modules/
-.next/
-.vercel/
 .env
 .env.local
 .env*.local
 __pycache__/
 *.pyc
 .DS_Store
-next-env.d.ts
+
+# Compiled locally / in the Docker build stage — never versioned.
+deobf/bin/luau
+deobf/bin/luau-ast
