@@ -1,105 +1,82 @@
-# Luau Deobfuscator — Web (Render)
+# Luau Deobfuscator — Web (Railway)
 
-Interfaz web para `deobf/deob.py`: un deobfuscador **dinámico** de scripts
+Interfaz web para `deobf/deob.py`: un deofuscador **dinámico** de scripts
 Roblox Luau. El script protegido corre en una VM real de Luau contra un
 entorno simulado de Roblox (`deobf/envlog.luau`), se traza su
-comportamiento y, para Luraph v15 / IronBrew1, se devirtualiza el bytecode
-de vuelta a Luau legible con control de flujo real.
+comportamiento y, para Luraph v15 / IronBrew 1, se devirtualiza el bytecode
+de vuelta a Luau legible con su control de flujo real.
 
-## Por qué Render y no Vercel
+## Por qué un servidor Docker (y no serverless)
 
-El motor necesita:
+El motor necesita un **binario `luau` nativo** compilado desde el código
+fuente con un patch propio, corre como **un subproceso por trabajo**
+(mantiene estado global, ver `CLAUDE.md`) y un script grande puede tardar
+**minutos**. Eso descarta funciones serverless; Railway lo corre como un
+servicio Docker de larga duración.
 
-- un **binario nativo `luau`** (compilado desde el código fuente de Luau,
-  con un patch específico — no un build estándar descargado),
-- correr como **subproceso independiente por cada trabajo** (mantiene
-  estado global entre corridas, ver `CLAUDE.md`),
-- y puede tardar **de segundos a 15+ minutos** en scripts grandes con
-  devirtualización completa.
-
-Nada de eso cabe en una función serverless de Vercel (límite duro de
-minutos, sin binarios nativos persistentes). Render corre esto como un
-**Web Service Docker** de larga duración, sin esas limitaciones.
-
-## Arquitectura
+## Estructura
 
 ```
-Dockerfile              build multi-stage: compila luau/luau-ast, arma la imagen final
-docker/build_luau_ast.py  compila deobf/bin/luau-ast (deob.py usa build_luau.py para `luau`)
-deobf/                   el motor real (tal cual se recibió; deobf/bin/*.exe se compilan en el build)
+Dockerfile                multi-stage: compila luau/luau-ast desde fuente y arma la imagen
+docker/build_luau_ast.py  compila deobf/bin/luau-ast (deobf/build_luau.py compila luau)
+railway.json              config de Railway (builder Dockerfile, healthcheck, reinicios)
+deobf/                    el motor, tal cual se recibió
 server/
-  app.py                 FastAPI: /api/health, /api/jobs (POST), /api/jobs/{id} (GET), sirve el frontend
-  jobs.py                job runner asíncrono: corre deob.py como subprocess en un hilo, con timeout duro
-  discord.py              notificaciones de inicio/fin/error a un webhook de Discord
-  static/                 frontend (HTML/CSS/JS vanilla, sin build step)
-render.yaml              Blueprint de Render (Web Service, runtime docker)
-samples/                  scripts de prueba (con y sin ofuscar) que trae el propio proyecto
+  app.py                  FastAPI: API de trabajos + sirve el frontend
+  jobs.py                 cola de trabajos: deob.py como subproceso, fases, cancelación
+  discord.py              webhook: inicio / fin (con el .luau adjunto) / error
+  static/                 frontend (HTML/CSS/JS, sin build; highlight.js incluido en vendor/)
+samples/                  scripts de ejemplo (la web los ofrece en "Ejemplos…")
 ```
 
-**Flujo de un trabajo:** `POST /api/jobs` crea el job y responde al toque
-con un `id` (no bloquea la request); un hilo en background corre
-`python deobf/deob.py <script> ...` como subproceso; el frontend hace
-`GET /api/jobs/{id}` cada 1.5s mostrando log y estado en vivo hasta que
-termina. Discord recibe un webhook al iniciar y al terminar (éxito o
-error).
+### API
+
+| Método | Ruta | Qué hace |
+|---|---|---|
+| `GET` | `/api/health` | Motor disponible, Discord configurado, trabajos en curso/en cola |
+| `POST` | `/api/jobs` | Crea un trabajo (`action`: `deobfuscate` \| `detect`) y responde al toque con su `id` |
+| `GET` | `/api/jobs/{id}` | Estado, fase (`queued` → `detect` → `trace` → `devirt` → `finish`), registro y resultado |
+| `POST` | `/api/jobs/{id}/cancel` | Cancela (mata `deob.py` y todos sus procesos `luau`) |
+| `GET` | `/api/samples`, `/api/samples/{name}` | Ejemplos incluidos |
+
+Los trabajos viven en memoria una hora después de terminar. La web guarda el
+trabajo en curso en el navegador, así que recargar la página lo retoma.
+
+## Deploy en Railway
+
+1. [railway.com](https://railway.com) → **New Project → Deploy from GitHub
+   repo** → elige este repo y la rama. Railway detecta `railway.json` y usa
+   el `Dockerfile`.
+2. En el servicio → **Variables**, agrega:
+   - `DISCORD_WEBHOOK_URL` = la URL de tu webhook
+   - (opcional) `MAX_CONCURRENT_JOBS`, `HARD_KILL_SECONDS` — ver `.env.example`
+3. **Settings → Networking → Generate Domain** para tener la URL pública.
+4. El primer build compila Luau desde fuente (varios minutos). Cuando el
+   healthcheck (`/api/health`) responde, la web está en línea.
+
+Railway inyecta `PORT` solo; no hay que configurarlo.
 
 ## Desarrollo local
 
-Necesitas Python 3.11+ y, para deofuscar de verdad (no solo servir la UI),
-el binario `luau` compilado:
+Necesitas Python 3.11+, git, cmake y g++:
 
 ```bash
-python3 deobf/build_luau.py --portable   # compila deobf/bin/luau (necesita git, cmake, g++)
-python3 docker/build_luau_ast.py --portable   # compila deobf/bin/luau-ast (opcional, solo para checks)
-
+python3 deobf/build_luau.py --portable        # -> deobf/bin/luau
+python3 docker/build_luau_ast.py --portable   # -> deobf/bin/luau-ast
 pip install -r server/requirements.txt
-uvicorn server.app:app --reload --port 8000
-# abre http://localhost:8000
+cp .env.example .env                          # pon tu DISCORD_WEBHOOK_URL
+uvicorn server.app:app --reload --port 8000   # http://localhost:8000
 ```
-
-Sin `deobf/bin/luau`, la UI carga igual pero el banner de "motor no
-disponible" se muestra y cualquier trabajo falla.
-
-## Variables de entorno
-
-| Variable              | Descripción                                                        |
-| ---------------------- | ------------------------------------------------------------------- |
-| `DISCORD_WEBHOOK_URL`  | Webhook de Discord. Notifica inicio, fin (éxito) y fin (error) de cada trabajo. Vacío = sin notificaciones. |
-| `PORT`                 | Puerto donde escucha uvicorn (Render lo inyecta solo). Default 8000 local. |
-
-Copia `.env.example` a `.env` para desarrollo local si usas un cargador de
-env vars, o expórtalas directo en la shell.
-
-## Deploy en Render
-
-1. Conecta el repo en [render.com](https://render.com) → **New → Blueprint**
-   y apunta a este repo (usa `render.yaml`), o crea un **Web Service**
-   manual con **Runtime: Docker** y este `Dockerfile`.
-2. En **Environment**, agrega `DISCORD_WEBHOOK_URL` con la URL de tu
-   webhook de Discord (Server Settings → Integrations → Webhooks →
-   New Webhook → Copy URL).
-3. Deploy. El build compila `luau`/`luau-ast` desde código fuente (tarda
-   varios minutos la primera vez); el health check pega a `/api/health`.
-
-**Plan free de Render:** el servicio se duerme tras inactividad y tarda
-unos segundos en despertar en la siguiente request — normal, no es un
-error. Para scripts grandes con devirtualización completa (varios
-minutos), considera un plan pago para evitar que el servicio se duerma
-a mitad de un trabajo largo.
 
 ## Límites conocidos
 
-- El detector de ofuscadores solo reconoce `luraph_v15` e `ironbrew1`;
-  todo lo demás cae al modo `generic` (solo trace de comportamiento, sin
-  devirtualización).
-- El trace no captura ramas no ejecutadas durante la corrida real.
-- Un kill switch del servidor mata cualquier trabajo que exceda 20
-  minutos (`server/jobs.py`, `HARD_KILL_SECONDS`), para que un job
-  colgado no tumbe el servicio.
+- Detecta `luraph_v15` e `ironbrew1`; el resto cae a `generic` (solo trace,
+  sin devirtualización).
+- El trace no incluye ramas que no se ejecutaron (la salida devirtualizada sí).
+- Discord no admite adjuntos de más de 8 MB: en ese caso el mensaje avisa
+  y el archivo se descarga desde la web.
 
 ## Uso previsto
 
-Herramienta educativa / de investigación para el ámbito estudiantil:
-entender técnicas de ofuscación en scripts Lua/Luau. No está pensada para
-eludir protecciones en sistemas que no te pertenecen ni tienes
-autorización para analizar.
+Herramienta educativa y de investigación: entender técnicas de ofuscación
+en scripts Lua/Luau. Analiza solo código que tengas permiso de analizar.

@@ -1,5 +1,9 @@
 .git
 .gitignore
-samples/
+.env
+.env.*
+samples/output/
+deobf/bin/luau
+deobf/bin/luau-ast
 **/__pycache__/
 **/*.pyc

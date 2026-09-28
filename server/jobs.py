@@ -3,15 +3,16 @@ In-memory async job runner: each job shells out to `deobf/deob.py` as its
 own subprocess (the engine keeps global state between runs and its own
 docs say to invoke it that way, never import it into a long-lived process).
 
-A job's HTTP lifecycle is create -> poll: POST /api/jobs returns
-immediately with a job id; the subprocess (which can take from seconds to
-15+ minutes for a full devirtualization) runs in a background thread while
-the frontend polls GET /api/jobs/{id}.
+POST /api/jobs returns immediately with a job id; the subprocess (seconds
+to 15+ minutes for a full devirtualization) runs in a background thread
+while the frontend polls GET /api/jobs/{id}. At most MAX_CONCURRENT_JOBS
+run at once; the rest wait in a FIFO queue.
 """
 
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,17 +20,35 @@ import threading
 import time
 import uuid
 
+from . import discord
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEOB_PY = os.path.join(REPO_ROOT, "deobf", "deob.py")
 LUAU_BIN = os.path.join(REPO_ROOT, "deobf", "bin", "luau")
 
 MAX_SOURCE_BYTES = 2_000_000
-# Full devirtualization of a big script can take minutes; this is a last-resort
-# kill switch so one stuck job can't hang the server forever.
-HARD_KILL_SECONDS = 20 * 60
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "2")))
+# Last-resort kill switch so one stuck job can't hold a slot forever.
+HARD_KILL_SECONDS = int(os.environ.get("HARD_KILL_SECONDS", str(20 * 60)))
+JOB_TTL_SECONDS = 60 * 60
+MAX_LOG_LINES = 2000
+
+OBFUSCATORS = ("auto-detect", "luraph_v15", "ironbrew1", "generic")
 
 _JOBS = {}
-_JOBS_LOCK = threading.Lock()
+_QUEUE = []
+_LOCK = threading.Lock()
+_SLOTS = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+# Log line prefix -> phase; the engine prints these to stderr as it goes.
+_PHASES = [
+    (re.compile(r"^\[\*\] obfuscator: "), "detect"),
+    (re.compile(r"^\[\*\] tracing "), "trace"),
+    (re.compile(r"^\[\*\] (devirtualizing|devirt round)"), "devirt"),
+    (re.compile(r"^\[\+\] result: "), "finish"),
+]
+_OBF_LINE = re.compile(r"^\[\*\] obfuscator: (.+?)(?: \(detected, ([0-9.]+)\))?$")
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def engine_available():
@@ -38,63 +57,128 @@ def engine_available():
 
 class Job:
     def __init__(self, filename, obfuscator, no_devirt, timeout, action):
-        self.id = str(uuid.uuid4())
-        self.filename = filename or "script.lua"
-        self.obfuscator = obfuscator or "auto-detect"
+        self.id = uuid.uuid4().hex
+        name = _SAFE_NAME.sub("_", os.path.basename(filename or "")).strip("._") or "script.lua"
+        self.filename = name[:120]
+        self.obfuscator = obfuscator
         self.no_devirt = bool(no_devirt)
         self.timeout = int(timeout)
         self.action = action
-        self.status = "pending"  # pending -> running -> done | error
+        self.status = "queued"  # queued -> running -> done | error | cancelled
+        self.phase = "queued"
         self.log = []
         self.output = None
         self.detected_obfuscator = None
+        self.confidence = None
         self.error = None
         self.created_at = time.time()
+        self.started_at = None
         self.finished_at = None
+        self.cancel_requested = False
+        self.proc = None
         self._lock = threading.Lock()
 
     def append_log(self, line):
-        if not line:
+        if not line or line.startswith("\0"):
             return
         with self._lock:
-            self.log.append(line)
+            if len(self.log) < MAX_LOG_LINES:
+                self.log.append(line)
+            elif len(self.log) == MAX_LOG_LINES:
+                self.log.append("[…] registro recortado")
+        for pat, phase in _PHASES:
+            if pat.match(line):
+                self.phase = phase
+                break
+        m = _OBF_LINE.match(line)
+        if m:
+            self.detected_obfuscator = m.group(1)
+            self.confidence = float(m.group(2)) if m.group(2) else None
 
     def elapsed_ms(self):
+        start = self.started_at or self.created_at
         end = self.finished_at or time.time()
-        return int((end - self.created_at) * 1000)
+        return int((end - start) * 1000)
 
     def to_dict(self):
         with self._lock:
             log = list(self.log)
+        position = None
+        if self.status == "queued":
+            with _LOCK:
+                position = _QUEUE.index(self.id) + 1 if self.id in _QUEUE else None
         return {
             "id": self.id,
             "action": self.action,
             "filename": self.filename,
+            "obfuscator": self.obfuscator,
+            "noDevirt": self.no_devirt,
             "status": self.status,
+            "phase": self.phase,
+            "queuePosition": position,
             "log": log,
             "output": self.output,
             "detectedObfuscator": self.detected_obfuscator,
+            "confidence": self.confidence,
             "error": self.error,
             "elapsedMs": self.elapsed_ms(),
         }
 
 
+def _prune():
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with _LOCK:
+        for jid in [j for j, job in _JOBS.items() if job.finished_at and job.finished_at < cutoff]:
+            del _JOBS[jid]
+
+
 def create_job(source, filename, obfuscator, no_devirt, timeout, action):
     if len(source.encode("utf-8", errors="ignore")) > MAX_SOURCE_BYTES:
-        raise ValueError("Script demasiado grande (máx %d bytes)." % MAX_SOURCE_BYTES)
+        raise ValueError("Script demasiado grande (máx. %d KB)." % (MAX_SOURCE_BYTES // 1000))
     if action not in ("deobfuscate", "detect"):
-        raise ValueError("action inválida.")
+        raise ValueError("Acción inválida.")
+    if obfuscator not in OBFUSCATORS:
+        raise ValueError("Ofuscador desconocido.")
 
+    _prune()
     job = Job(filename, obfuscator, no_devirt, timeout, action)
-    with _JOBS_LOCK:
+    with _LOCK:
         _JOBS[job.id] = job
+        _QUEUE.append(job.id)
     threading.Thread(target=_run_job, args=(job, source), daemon=True).start()
     return job
 
 
 def get_job(job_id):
-    with _JOBS_LOCK:
+    with _LOCK:
         return _JOBS.get(job_id)
+
+
+def _kill_tree(proc):
+    """deob.py spawns luau children; killing only deob.py would orphan them at 100% CPU."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def cancel_job(job):
+    job.cancel_requested = True
+    with _LOCK:
+        if job.id in _QUEUE:
+            _QUEUE.remove(job.id)
+            job.status, job.error = "cancelled", "Cancelado antes de empezar."
+            job.phase, job.finished_at = "finish", time.time()
+    proc = job.proc
+    if proc:
+        _kill_tree(proc)
+
+
+def stats():
+    with _LOCK:
+        running = sum(1 for j in _JOBS.values() if j.status == "running")
+        queued = len(_QUEUE)
+    return {"running": running, "queued": queued, "maxConcurrent": MAX_CONCURRENT_JOBS}
 
 
 def _reader(stream, sink):
@@ -106,9 +190,20 @@ def _reader(stream, sink):
 
 
 def _run_job(job, source):
-    from . import discord
+    _SLOTS.acquire()
+    with _LOCK:
+        if job.id in _QUEUE:
+            _QUEUE.remove(job.id)
+    if job.cancel_requested:
+        if job.status != "cancelled":
+            job.status, job.error = "cancelled", "Cancelado antes de empezar."
+            job.phase, job.finished_at = "finish", time.time()
+        _SLOTS.release()
+        return
 
     job.status = "running"
+    job.phase = "detect"
+    job.started_at = time.time()
     discord.notify_started(job)
 
     workdir = tempfile.mkdtemp(prefix="deobjob_")
@@ -126,68 +221,70 @@ def _run_job(job, source):
             cmd += ["-o", out_path]
             if job.no_devirt:
                 cmd.append("--no-devirt")
-        if job.obfuscator and job.obfuscator != "auto-detect":
+        if job.obfuscator != "auto-detect":
             cmd += ["--obfuscator", job.obfuscator]
 
-        job.append_log("$ " + " ".join(os.path.basename(c) if c == DEOB_PY else c for c in cmd))
-
-        proc = subprocess.Popen(
+        job.proc = subprocess.Popen(
             cmd,
             cwd=REPO_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            start_new_session=True,  # own process group, so _kill_tree gets the luau children too
         )
-        t_out = threading.Thread(
-            target=_reader, args=(proc.stdout, lambda l: (stdout_lines.append(l), job.append_log(l)))
-        )
-        t_err = threading.Thread(target=_reader, args=(proc.stderr, job.append_log))
-        t_out.start()
-        t_err.start()
+        if job.cancel_requested:  # cancelled between dequeue and spawn
+            _kill_tree(job.proc)
+
+        def on_stdout(line):
+            stdout_lines.append(line)
+            job.append_log(line)
+
+        readers = [
+            threading.Thread(target=_reader, args=(job.proc.stdout, on_stdout), daemon=True),
+            threading.Thread(target=_reader, args=(job.proc.stderr, job.append_log), daemon=True),
+        ]
+        for t in readers:
+            t.start()
 
         try:
-            code = proc.wait(timeout=HARD_KILL_SECONDS)
+            code = job.proc.wait(timeout=HARD_KILL_SECONDS)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            _kill_tree(job.proc)
+            job.proc.wait()
             code = -9
-            job.append_log("[!] límite duro del servidor excedido (%ds): proceso terminado" % HARD_KILL_SECONDS)
+            job.append_log("[!] límite del servidor excedido (%d s): proceso terminado" % HARD_KILL_SECONDS)
+        for t in readers:
+            t.join(timeout=5)
 
-        t_out.join(timeout=5)
-        t_err.join(timeout=5)
-
-        if job.action == "detect":
-            if code == 0 and stdout_lines:
-                parts = stdout_lines[-1].split("\t")
-                job.detected_obfuscator = parts[0] if parts else None
+        if job.cancel_requested:
+            job.status, job.error = "cancelled", "Cancelado por el usuario."
+        elif job.action == "detect":
+            parts = stdout_lines[-1].split("\t") if stdout_lines else []
+            if code == 0 and len(parts) >= 3:
+                job.detected_obfuscator = parts[2]
+                job.confidence = None if parts[1] == "forced" else float(parts[1])
                 job.status = "done"
             else:
-                job.status = "error"
-                job.error = "La detección falló (código %s)." % code
+                job.status, job.error = "error", "La detección falló (código %s)." % code
+        elif code == 0 and os.path.exists(out_path):
+            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                job.output = f.read()
+            job.status = "done"
         else:
-            for line in job.log:
-                m = re.match(r"^\[\*\] obfuscator: (.+?)(?: \(detected.*)?$", line)
-                if m:
-                    job.detected_obfuscator = m.group(1)
-                    break
-            if code == 0 and os.path.exists(out_path):
-                with open(out_path, "r", encoding="utf-8", errors="replace") as f:
-                    job.output = f.read()
-                job.status = "done"
-            else:
-                job.status = "error"
-                job.error = "El motor no produjo salida (código %s). Revisa el registro." % code
+            job.status = "error"
+            job.error = "El motor no produjo salida (código %s). Revisa el registro." % code
     except Exception as exc:  # noqa: BLE001
-        job.status = "error"
-        job.error = str(exc)
+        job.status, job.error = "error", str(exc)
         job.append_log("[!] %s" % exc)
     finally:
+        if job.proc:
+            _kill_tree(job.proc)  # stragglers (e.g. a long-lived luau REPL) die with the job
+        job.phase = "finish"
         job.finished_at = time.time()
+        job.proc = None
         shutil.rmtree(workdir, ignore_errors=True)
-        try:
-            from . import discord
-
-            discord.notify_finished(job)
-        except Exception:
-            pass
+        _SLOTS.release()
+        discord.notify_finished(job)

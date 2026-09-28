@@ -3,7 +3,7 @@
 # runs the protected script against. No prebuilt binary ships in the repo;
 # CLAUDE.md requires a locally built luau (Vector3 metatable left
 # writable) rather than a stock download. --portable avoids -march=native
-# so the binary works on whatever CPU Render assigns the build.
+# so the binary works on whatever CPU the host (Railway) runs it on.
 FROM debian:bookworm-slim AS luau-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,10 +30,11 @@ RUN pip install --no-cache-dir -r server/requirements.txt
 
 COPY deobf/ deobf/
 COPY server/ server/
+COPY samples/ samples/
 COPY --from=luau-builder /build/deobf/bin/luau deobf/bin/luau
 COPY --from=luau-builder /build/deobf/bin/luau-ast deobf/bin/luau-ast
 RUN chmod +x deobf/bin/luau deobf/bin/luau-ast
 
-ENV PORT=8000
+ENV PORT=8000 PYTHONUNBUFFERED=1
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]
