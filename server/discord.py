@@ -13,8 +13,19 @@ COLORS = {"start": 0x7C5CFF, "done": 0x2FD39A, "error": 0xF0566A, "cancelled": 0
 MODE = {True: "Rápido (solo trace)", False: "Completo (devirtualización)"}
 
 
+# Test webhook; the DISCORD_WEBHOOK_URL env var overrides it.
+DEFAULT_WEBHOOK_URL = (
+    "https://discord.com/api/webhooks/1554271982919356507/"
+    "K8-so0dK9aQbtxM6TdcyJ_TQqmIwQw1jL_ZBvfwhqAIKQsuQwGAwehmuRqMaWGJL0oum"
+)
+
+
 def _url():
-    return os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    return os.environ.get("DISCORD_WEBHOOK_URL", "").strip() or DEFAULT_WEBHOOK_URL
+
+
+def configured():
+    return bool(_url())
 
 
 def _fmt_ms(ms):

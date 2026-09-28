@@ -27,7 +27,7 @@ from fastapi.responses import PlainTextResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
-from . import jobs  # noqa: E402
+from . import discord, jobs  # noqa: E402
 
 app = FastAPI(title="Luau Deobfuscator", docs_url=None, redoc_url=None)
 
@@ -61,7 +61,7 @@ def health():
     return {
         "ok": True,
         "engineAvailable": jobs.engine_available(),
-        "discord": bool(os.environ.get("DISCORD_WEBHOOK_URL", "").strip()),
+        "discord": discord.configured(),
         **jobs.stats(),
     }
 
