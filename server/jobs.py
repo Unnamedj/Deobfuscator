@@ -49,10 +49,41 @@ _PHASES = [
 ]
 _OBF_LINE = re.compile(r"^\[\*\] obfuscator: (.+?)(?: \(detected, ([0-9.]+)\))?$")
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+MAX_LINE_CHARS = 2000
 
 
 def engine_available():
     return os.path.isfile(DEOB_PY) and os.path.isfile(LUAU_BIN)
+
+
+def _read_first(paths, key=None):
+    """First readable cgroup file: its `key <n>` line, or its whole value."""
+    for path in paths:
+        try:
+            with open(path) as f:
+                if key is None:
+                    return f.read().strip()
+                for line in f:
+                    k, _, v = line.partition(" ")
+                    if k == key:
+                        return int(v)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _oom_kills():
+    return _read_first(["/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory/memory.oom_control"], "oom_kill")
+
+
+def memory_limit_mb():
+    raw = _read_first(["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"])
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None  # "max" (v2) or unreadable: no limit we can report
+    return n // (1024 * 1024) if n < 1 << 50 else None
 
 
 class Job:
@@ -79,8 +110,13 @@ class Job:
         self._lock = threading.Lock()
 
     def append_log(self, line):
-        if not line or line.startswith("\0"):
+        # Failure paths dump raw luau stdout: \0-prefixed protocol markers and
+        # 16 KB heartbeat padding. Keep the text, drop the noise.
+        line = _CONTROL.sub("", line).rstrip()
+        if not line.strip() or line == "HB":
             return
+        if len(line) > MAX_LINE_CHARS:
+            line = line[:MAX_LINE_CHARS] + " …"
         with self._lock:
             if len(self.log) < MAX_LOG_LINES:
                 self.log.append(line)
@@ -189,6 +225,28 @@ def _reader(stream, sink):
         pass
 
 
+def _diagnose(job, code, oom_before):
+    """A readable cause for a failed run; the engine's own message can be empty
+    when the luau VM is killed from outside (it then only echoes luau's output)."""
+    oom_after = _oom_kills()
+    if oom_before is not None and oom_after is not None and oom_after > oom_before:
+        limit = memory_limit_mb()
+        msg = ("Sin memoria: el sistema mató la VM de Luau%s. Sube la RAM del servicio en Railway, "
+               "baja MAX_CONCURRENT_JOBS o prueba el modo Rápido."
+               % (" (límite del contenedor: %d MB)" % limit if limit else ""))
+        job.append_log("[!] " + msg)
+        return msg
+    if code == -9:
+        return "El trabajo superó el tiempo máximo del servidor."
+    if any(line == "[!]" for line in job.log):
+        msg = ("La VM de Luau se cerró de golpe sin mensaje de error: casi siempre es falta de memoria "
+               "del servidor (o un crash nativo del script).")
+        job.append_log("[!] " + msg)
+        return msg
+    last = next((l for l in reversed(job.log) if l.startswith("[!]") and len(l) > 4), None)
+    return last[4:].strip()[:300] if last else "El motor no produjo salida (código %s)." % code
+
+
 def _run_job(job, source):
     _SLOTS.acquire()
     with _LOCK:
@@ -224,6 +282,7 @@ def _run_job(job, source):
         if job.obfuscator != "auto-detect":
             cmd += ["--obfuscator", job.obfuscator]
 
+        oom_before = _oom_kills()
         job.proc = subprocess.Popen(
             cmd,
             cwd=REPO_ROOT,
@@ -275,7 +334,7 @@ def _run_job(job, source):
             job.status = "done"
         else:
             job.status = "error"
-            job.error = "El motor no produjo salida (código %s). Revisa el registro." % code
+            job.error = _diagnose(job, code, oom_before)
     except Exception as exc:  # noqa: BLE001
         job.status, job.error = "error", str(exc)
         job.append_log("[!] %s" % exc)

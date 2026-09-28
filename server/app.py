@@ -97,6 +97,7 @@ def health():
         "ok": True,
         "engineAvailable": jobs.engine_available(),
         "discord": discord.configured(),
+        "memoryLimitMb": jobs.memory_limit_mb(),
         **jobs.stats(),
     }
 
