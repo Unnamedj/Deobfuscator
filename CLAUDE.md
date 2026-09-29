@@ -154,6 +154,9 @@ python deobf/deob.py <script> --debug            # all intermediate files in <in
   prefix/suffix outside the `if` (`captureFunction`, `rec.alt` in `resolve`).
   The `false` run is kept only when it finishes without errors.
 - Caps: 250k statements, 25k per block. Budget abort keeps partial `task.spawn` bodies.
+- Render depth: self re-arming callbacks nest thousands deep, so `renderBlock` stops past
+  `--cfg max_depth` (120) with a `-- [envlog] deeper nesting omitted` line. `resolve` fills
+  markers with `CHAIN.subMarkers` (a Luau loop): a gsub callback per level hit Luau's C-call cap (~200).
 
 ### Folding (helpers and loops)
 - Needs proto attribution: `emit` walks the Lua stack (`CHAIN.get`) into

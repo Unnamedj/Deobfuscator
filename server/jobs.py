@@ -27,7 +27,7 @@ DEOB_PY = os.path.join(REPO_ROOT, "deobf", "deob.py")
 LUAU_BIN = os.path.join(REPO_ROOT, "deobf", "bin", "luau")
 
 MAX_SOURCE_BYTES = 2_000_000
-MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "2")))
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "1")))
 # Last-resort kill switch so one stuck job can't hold a slot forever.
 HARD_KILL_SECONDS = int(os.environ.get("HARD_KILL_SECONDS", str(20 * 60)))
 JOB_TTL_SECONDS = 60 * 60

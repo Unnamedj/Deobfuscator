@@ -4365,15 +4365,34 @@ end
 
 local renderBlock
 
+-- gsub(text, "<open>(%d+)<close>", fn) as a plain Luau loop; fn gets (match start, digits).
+-- resolve recurses once per nested function/block, and a gsub callback costs a
+-- C call per level: past Luau's C-call limit (~200) deep traces died in render
+-- with "C stack overflow". (A CHAIN field: the top-level chunk has no locals left.)
+CHAIN.subMarkers = function(text, pat, fn)
+	local s, e, id = R.find(text, pat)
+	if not s then return text end
+	local out, n, i = {}, 0, 1
+	while s do
+		out[n + 1] = R.sub(text, i, s - 1)
+		out[n + 2] = fn(s, id)
+		n += 2
+		i = e + 1
+		s, e, id = R.find(text, pat, i)
+	end
+	out[n + 1] = R.sub(text, i)
+	return R.concat(out)
+end
+
 function resolve(text, ind)
-	text = R.gsub(text, "\1(%d+)\2", function(id)
+	text = CHAIN.subMarkers(text, "\1(%d+)\2", function(_, id)
 		local p = BYID[R.tonumber(id)]
 		if not p then return "nil" end
 		INFO[p].indent = ind
 		return exprOf(p)
 	end)
 	local src = text
-	text = R.gsub(text, "()\3(%d+)\4", function(pos, fid)
+	text = CHAIN.subMarkers(text, "\3(%d+)\4", function(pos, fid)
 		local rec = FREC[R.tonumber(fid)]
 		-- a function inside a multi-line table sits deeper than the statement
 		local k = 0
@@ -4447,6 +4466,13 @@ end
 -- (<lines> = how many output lines the statement takes)
 function renderBlock(block, ind, out)
 	local pad = R.rep("\t", ind)
+	-- a script that re-arms itself (callback -> task.spawn/delay -> callback ...)
+	-- nests one level per round, thousands deep: unreadable, and rendering it
+	-- overflows the Lua stack. --cfg max_depth=N moves the cut.
+	if ind > (R.tonumber(CFG.max_depth) or 120) and #block.lines > 0 then
+		R.insert(out, pad .. "-- [envlog] deeper nesting omitted (" .. #block.lines .. " statement(s) at this level)")
+		return
+	end
 	for _, s in block.lines do
 		local mark = CHAIN.markers and #out + 1
 		if mark then R.insert(out, false) end
