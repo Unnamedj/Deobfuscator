@@ -83,34 +83,37 @@ def patch_entries(source, path):
     return "\n".join(lines)
 
 
-def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
+def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None, devirt=None):
     """Lift the captured protos; constants that only Luraph's lazy decoder can
     produce (code that never ran) are requested from further runs. With a
     live harness (`live()` -> fetch function, while the long-lived harness
     made the current dump) the walks ask for them right away (a chain of
     constants, each needed to find the next, then takes one round instead
     of one round per link)."""
-    from obfuscators.luraph_v15 import devirt
+    if devirt is None:
+        from obfuscators.luraph_v15 import devirt
     args = job.args
     requested = set()
     last_bufs = ""
     text = None
     rounds = args.devirt_rounds
-    # Intermediate rounds only need the constant requests and decrypted
-    # strings, which come from walking each function: they skip the
-    # structuring/codegen/naming and reuse the walks of functions that asked
-    # for nothing (devirt.collect_requests). The text comes from one full lift
-    # at the fixed point; if that lift still asks for something new, the
-    # remaining rounds are full lifts (the old way).
+
     quick = not os.environ.get("DEVIRT_FULL_ROUNDS")
     cache = devirt.WalkCache()
     t0 = time.time()
+    last_errors = None
     for rnd in range(1, rounds + 1):
         t1 = time.time()
-        full = not quick
-        if quick:
+
+        if quick and last_errors == 0:
+            full = True
+        else:
+            full = not quick
+
+        if not full and quick:
             stats, reqs, bufs = devirt.run_big_stack(devirt.collect_requests, job.source_path, ppath, chunk_paths, cache,
                                                      live and live())
+            last_errors = stats.get("errors", 0)
             new = reqs - requested
             print("[*] devirt round %d: %d functions (%d walked), %d unlifted blocks, %d new constant requests%s "
                   "(%.1fs)" % (rnd, stats["functions"], stats["walked"], stats["errors"], len(new),
@@ -130,6 +133,11 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps, %d new constant requests (%.1fs)"
                   % (stats["functions"], stats["errors"], stats["fallbacks"], len(new), time.time() - t1),
                   file=sys.stderr)
+            if rnd == 1 and stats["functions"] == 0:
+                raise SystemExit("[!] this build uses a VM layout the lifter cannot read "
+                                 "(no closure makers / dispatchers found; likely a method-based "
+                                 "state-machine VM). Only the behaviour trace is available; run "
+                                 "with --no-devirt to skip the lift attempt.")
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 break
             if quick:
@@ -139,7 +147,7 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
         last_bufs = bufs
         c = dict(cfg)
         c["force_req"] = ";".join(sorted(requested))
-        # strings decrypted in place by lifted code the runtime never ran
+
         c["force_buf"] = bufs
         t1 = time.time()
         body, err = rerun(c)
@@ -312,17 +320,26 @@ def run(job):
     return job.trace_path
 
 
-def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):
+def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths, devirt_module=None):
     """devirtualize() with its constant rounds answered by one long-lived
     harness (started now, so the script runs while round 1 walks); a fresh
     run per round if it fails or behaves differently."""
     args = job.args
     bridge = runner.bridge
     server = [None]
-    synced = [False]    # the long-lived harness made the current dump
+    synced = [False]    
     if not bridge and not os.environ.get("DEOB_NO_SERVE"):
-        server[0] = harness.HarnessServer(runner.luau, patched, cfg, chunks)
-        server.append(False)    # its first run not checked yet
+        hs = harness.HarnessServer(runner.luau, patched, cfg, chunks)
+        server[0] = hs
+        first, err = hs.reply(args.timeout)
+        server.append(True)
+        if first is not None and harness.same_trace(harness.trace_text(first), run_text):
+            synced[0] = True
+        else:
+            if first is None:
+                print("[!] the long-lived harness failed: %s; running the script once per round instead" % err[-300:], file=sys.stderr)
+            hs.close()
+            server[0] = None    
 
     def live():
         hs = server[0]
@@ -359,9 +376,9 @@ def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths)
             server[0] = None
         return runner.run(patched, c, chunks)
     try:
-        devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths, live)
+        devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths, live, devirt_module)
     except Exception as e:
-        # never lose the run over a lifter bug: the trace is still a result
+
         print("[!] devirtualization failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)
         if os.environ.get("DEVIRT_TB"):
             import traceback

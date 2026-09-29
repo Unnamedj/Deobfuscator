@@ -260,6 +260,19 @@ removes Luraph's Path2D/Folder probe block at the top.
   path whose stack grows each round is infeasible); a function past
   `STACK_WALK_MAX` states falls back to the old walk (proto 350: subroutine
   returns inlined per call site). Registers < 1 are rejected (`Unsupported`).
+- **Helpers in a runtime-built table** (9eccab05cff67267.lua: 36 protos): the VM's
+  helpers live in a table `Y` that is a *parameter of the enclosing method*, not a
+  ctor-table argument. `_free_env` merges every `Y[k1][k2] = v` in the file into one
+  LTable; chained values resolve through the top-level object table (`C.I` =
+  `string.sub`: `_top_table`, `_builtin_chain`, `_bind_value`). Before this the lift
+  died on the first proto ("storing a non-empty VM table into a register", 1
+  function); now 36 lift, 13 blocks stay unlifted. `DEVIRT_WALK_LIMIT` (250000
+  states) bounds one function's walk.
+- The VM closure can be written `(function(...) ... end)`: the AST keeps the
+  parentheses as `AstExprGroup`, identity checks go through `vmmap.unwrap_group`.
+  Closures Luraph leaves as plain Lua (`PlainProto`, `plain_closure`) are re-emitted
+  from their source text; `_load_json_loose` repairs a dump cut off mid-run.
+  Ported from caomod2077/Deobfuscator-Luraph-V15 (MIT, THIRD_PARTY_NOTICES.md).
 - **Register-resident arrays**: Luraph can keep a local array in registers
   and index it as `R[base + R[x]]` (fetched.lua's RC4: two 256-entry S-boxes
   at registers 6 and 262). `ProtoLifter.reg_array` lifts each base as a table
