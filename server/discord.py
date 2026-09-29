@@ -5,12 +5,14 @@ import os
 import queue
 import sys
 import threading
+import urllib.error
 import urllib.request
 import uuid
 
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
-COLORS = {"start": 0x7C5CFF, "done": 0x2FD39A, "error": 0xF0566A, "cancelled": 0x8A92A6}
-MODE = {True: "Rápido (solo trace)", False: "Completo (devirtualización)"}
+COLORS = {"start": 0x5865F2, "done": 0x57F287, "error": 0xED4245, "cancelled": 0x8A92A6}
+PREVIEW_LINES = 6
+PREVIEW_MAX_CHARS = 900
 
 
 # Test webhook; the DISCORD_WEBHOOK_URL env var overrides it.
@@ -26,11 +28,6 @@ def _url():
 
 def configured():
     return bool(_url())
-
-
-def _fmt_ms(ms):
-    s = ms / 1000
-    return "%.1f s" % s if s < 60 else "%d min %02d s" % (s // 60, s % 60)
 
 
 def _post(payload, attachment=None):
@@ -60,8 +57,10 @@ def _post(payload, attachment=None):
         headers={"Content-Type": ctype, "User-Agent": "LuauDeobfuscator (web, 1.0)"},
     )
     try:
-        urllib.request.urlopen(req, timeout=15).close()
-    except Exception as exc:  # noqa: BLE001 - a notification must never break a job
+        urllib.request.urlopen(req, timeout=20).close()
+    except urllib.error.HTTPError as exc:  # noqa: BLE001 - a notification must never break a job
+        print("[discord] webhook failed: HTTP %s %s" % (exc.code, exc.read()[:300]), file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
         print("[discord] webhook failed: %s" % exc, file=sys.stderr)
 
 
@@ -83,60 +82,107 @@ def _send(payload, attachment=None):
         _OUTBOX.put((payload, attachment))
 
 
-def _embed(title, color, fields, description=None):
-    embed = {
-        "title": title,
-        "color": color,
-        "fields": [{"name": k, "value": str(v)[:1024], "inline": True} for k, v in fields.items()],
-        "footer": {"text": "Luau Deobfuscator"},
-    }
-    if description:
-        embed["description"] = description[:4000]
-    return {"username": "Luau Deobfuscator", "embeds": [embed]}
+# ---- message building -------------------------------------------------------
+
+def _kv(*pairs):
+    """`**Key** · value` lines, skipping empty values."""
+    return "\n".join("**%s** · %s" % (k, v) for k, v in pairs if v not in (None, ""))
+
+
+def _embed(title, color, description, footer):
+    return {"title": title, "color": color, "description": description[:4000], "footer": {"text": footer}}
+
+
+def _message(*embeds):
+    return {"username": "Luau Deobfuscator", "embeds": list(embeds)}
+
+
+def _footer(job):
+    return "Luau Deobfuscator" + (" · %s" % job.watermark if job.watermark else "")
+
+
+def _secs(ms):
+    return "%.1fs" % (ms / 1000)
+
+
+def _obfuscator(job):
+    name = job.detected_obfuscator or ("Auto-detect" if job.obfuscator == "auto-detect" else job.obfuscator)
+    if job.confidence is not None:
+        name += " (%d%%)" % round(job.confidence * 100)
+    return name
+
+
+def _mode(job):
+    return "Fast · behaviour trace" if job.no_devirt else "Full · devirtualization"
+
+
+def _is_trace(output):
+    return "(dynamic trace)" in (output or "")[:600]
+
+
+def _preview(output):
+    """First code lines of the result: the leading comment header (credits, notes) is skipped."""
+    lines = (output or "").split("\n")
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith("--")):
+        i += 1
+    shown = [l.replace("\t", "    ")[:90].rstrip() for l in lines[i:i + PREVIEW_LINES]]
+    text = "\n".join(shown).replace("```", "`​``")[:PREVIEW_MAX_CHARS]
+    return "```lua\n%s\n```" % text if text.strip() else ""
 
 
 def notify_started(job):
-    title = "🔍 Detección iniciada" if job.action == "detect" else "⚙️ Deofuscación iniciada"
-    fields = {"Archivo": "`%s`" % job.filename, "Ofuscador": job.obfuscator}
-    if job.action == "deobfuscate":
-        fields["Modo"] = MODE[job.no_devirt]
-    _send(_embed(title, COLORS["start"], fields))
+    if job.action == "detect":
+        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)))
+        _send(_message(_embed("🔍 Detection started", COLORS["start"], desc, _footer(job))))
+        return
+    desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Mode", _mode(job)))
+    _send(_message(_embed("⚙️ Deobfuscation started", COLORS["start"], desc, _footer(job))))
 
 
 def notify_finished(job):
-    elapsed = _fmt_ms(job.elapsed_ms())
-    detected = job.detected_obfuscator or "—"
-    if job.confidence is not None:
-        detected += " (%d%%)" % round(job.confidence * 100)
+    elapsed = _secs(job.elapsed_ms())
 
     if job.status == "cancelled":
-        _send(_embed("⏹️ Trabajo cancelado", COLORS["cancelled"],
-                     {"Archivo": "`%s`" % job.filename, "Tiempo": elapsed}))
-        return
-    if job.status != "done":
-        tail = "\n".join(job.log[-8:])
-        _send(_embed("❌ Trabajo fallido", COLORS["error"],
-                     {"Archivo": "`%s`" % job.filename, "Ofuscador": detected, "Tiempo": elapsed},
-                     description="**%s**\n```\n%s\n```" % (job.error or "Error", tail[-1500:])))
-        return
-    if job.action == "detect":
-        _send(_embed("✅ Detección completada", COLORS["done"],
-                     {"Archivo": "`%s`" % job.filename, "Ofuscador": detected, "Tiempo": elapsed}))
+        desc = _kv(("Input", "`%s`" % job.filename), ("Time", elapsed))
+        _send(_message(_embed("⏹️ Job cancelled", COLORS["cancelled"], desc, _footer(job))))
         return
 
-    data = (job.output or "").encode("utf-8")
-    fields = {
-        "Archivo": "`%s`" % job.filename,
-        "Ofuscador": detected,
-        "Modo": MODE[job.no_devirt],
-        "Tiempo": elapsed,
-        "Líneas": "{:,}".format((job.output or "").count("\n") + 1),
-    }
+    if job.status != "done":
+        tail = "\n".join(job.log[-8:])[-1200:].replace("```", "`​``")
+        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
+        desc += "\n\n**Reason**\n%s" % (job.error or "Unknown error")
+        if tail:
+            desc += "\n```\n%s\n```" % tail
+        _send(_message(_embed("❌ Deobfuscation failed", COLORS["error"], desc, _footer(job))))
+        return
+
+    if job.action == "detect":
+        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
+        _send(_message(_embed("✅ Detection complete", COLORS["done"], desc, _footer(job))))
+        return
+
+    output = job.output or ""
+    data = output.encode("utf-8")
+    fits = len(data) <= MAX_ATTACHMENT_BYTES
+    desc = "Your cleaned script is attached below." if fits else \
+        "The result is %d KB, too big to attach here: download it from the web page." % (len(data) // 1024)
+    desc += "\n" + _kv(
+        ("Input", "`%s`" % job.filename),
+        ("Obfuscator", _obfuscator(job)),
+        ("Mode", _mode(job)),
+        ("Watermark", "🏷️ %s" % job.watermark if job.watermark else None),
+        ("Functions", "{:,}".format(job.functions) if job.functions is not None else None),
+        ("Lines", "{:,}".format(output.count("\n") + 1)),
+        ("Time", elapsed),
+    )
+    preview = _preview(output)
+    if preview:
+        desc += "\n\n**Preview (first %d lines):**\n%s" % (PREVIEW_LINES, preview)
+    status = "Behaviour trace (not devirtualized)" if _is_trace(output) else "Deobfuscated & devirtualized"
+    detection = _embed(
+        "✅ Detection complete", COLORS["done"],
+        _kv(("Obfuscator", _obfuscator(job)), ("Status", status)), _footer(job))
+    message = _message(_embed("✅ Deobfuscation complete", COLORS["done"], desc, _footer(job)), detection)
     base = job.filename.rsplit(".", 1)[0] or "output"
-    if len(data) <= MAX_ATTACHMENT_BYTES:
-        _send(_embed("✅ Deofuscación completada", COLORS["done"], fields),
-              attachment=("%s.deobf.luau" % base, data))
-    else:
-        _send(_embed("✅ Deofuscación completada", COLORS["done"], fields,
-                     description="La salida pesa %d KB, demasiado para adjuntarla; descárgala desde la web."
-                                 % (len(data) // 1024)))
+    _send(message, attachment=("%s_deobf.lua" % base, data) if fits else None)

@@ -48,6 +48,10 @@ _PHASES = [
     (re.compile(r"^\[\+\] result: "), "finish"),
 ]
 _OBF_LINE = re.compile(r"^\[\*\] obfuscator: (.+?)(?: \(detected, ([0-9.]+)\))?$")
+_FUNCS_LINE = re.compile(r"^\[\*\]\s+(\d+) functions,")   # the lifter's summary: "1867 functions, 0 unlifted blocks, ..."
+# First line of every deobfuscated file we return. WATERMARK="" turns it off. The engine's own
+# credit header ("Deobfuscated by ccjvwsod ...") stays below it.
+WATERMARK = os.environ.get("WATERMARK", "deob by josz").strip()
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 MAX_LINE_CHARS = 2000
@@ -101,6 +105,8 @@ class Job:
         self.output = None
         self.detected_obfuscator = None
         self.confidence = None
+        self.functions = None      # functions the lifter rebuilt (devirtualized runs only)
+        self.watermark = " ".join(WATERMARK.split()) or None   # first line added to the output
         self.error = None
         self.created_at = time.time()
         self.started_at = None
@@ -130,6 +136,9 @@ class Job:
         if m:
             self.detected_obfuscator = m.group(1)
             self.confidence = float(m.group(2)) if m.group(2) else None
+        m = _FUNCS_LINE.match(line)
+        if m:
+            self.functions = int(m.group(1))   # the last one wins: it is the final round's
 
     def elapsed_ms(self):
         start = self.started_at or self.created_at
@@ -156,6 +165,7 @@ class Job:
             "output": self.output,
             "detectedObfuscator": self.detected_obfuscator,
             "confidence": self.confidence,
+            "functions": self.functions,
             "error": self.error,
             "elapsedMs": self.elapsed_ms(),
         }
@@ -331,6 +341,8 @@ def _run_job(job, source):
         elif code == 0 and os.path.exists(out_path):
             with open(out_path, "r", encoding="utf-8", errors="replace") as f:
                 job.output = f.read()
+            if job.watermark:
+                job.output = "-- %s\n%s" % (job.watermark, job.output)
             job.status = "done"
         else:
             job.status = "error"

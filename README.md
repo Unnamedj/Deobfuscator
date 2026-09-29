@@ -39,6 +39,13 @@ samples/                  scripts de ejemplo (la web los ofrece en "Ejemplos…"
 | `POST` | `/api/jobs/{id}/cancel` | Cancela (mata `deob.py` y todos sus procesos `luau`) |
 | `GET` | `/api/samples`, `/api/samples/{name}` | Ejemplos incluidos |
 
+### Marca de agua y mensaje de Discord
+
+Cada script deofuscado empieza con `-- deob by josz` (variable `WATERMARK`; vacía = sin marca);
+debajo queda el crédito del motor original. Al terminar, Discord recibe un embed con el archivo
+adjunto (`<nombre>_deobf.lua`), los datos del trabajo (ofuscador, modo, funciones, líneas, tiempo)
+y una vista previa de las primeras 6 líneas de código.
+
 Los trabajos viven en memoria una hora después de terminar. La web guarda el
 trabajo en curso en el navegador, así que recargar la página lo retoma.
 

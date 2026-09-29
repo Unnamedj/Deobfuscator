@@ -221,6 +221,7 @@
     }
     if (d.action === "deobfuscate") chips.push(`<span class="stat">Modo <b>${d.noDevirt ? "Rápido" : "Completo"}</b></span>`);
     chips.push(`<span class="stat">Tiempo <b>${human(d.elapsedMs)}</b></span>`);
+    if (d.functions != null && d.output) chips.push(`<span class="stat">Funciones <b>${d.functions.toLocaleString("es")}</b></span>`);
     if (d.output) {
       chips.push(`<span class="stat">Líneas <b>${d.output.split("\n").length.toLocaleString("es")}</b></span>`);
       chips.push(`<span class="stat">Tamaño <b>${kb(new Blob([d.output]).size)}</b></span>`);
