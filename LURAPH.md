@@ -349,3 +349,12 @@ removes Luraph's Path2D/Folder probe block at the top.
 - Without the long-lived harness, constant rounds converge one nesting
   level per round. Loader VM roots can't be lifted (`storing a non-empty VM
   table into a register`).
+- **Luarmor V4 chains** (zap_1/2/3): the wrapper (`Luarmor V4 bootstrapper`, detect 0.01) kicks when run
+  directly and fetches the real script from Luarmor's servers, so there is nothing to deobfuscate in
+  it (the web app says so). Stage 1 (Luraph v15, 0.80) `loadstring`s stage 2 (a VM with no payload of
+  its own: it ends in `...}):Z2(...)` and needs the bytecode as an argument; alone it dies at
+  `readu8(nil)`). Stage 1 itself crashes in the harness at `bit32.band(<proxy>)` after calling an
+  invented global `math_floor_precision(n)` (n differs per run: an anti-tamper probe that expects a
+  real environment to fail). Its lift (48 functions) is a loader stub and does not compile: 411 active
+  locals, 1687 gotos. `devirtualize()` giving up (`sys.exit("[!] ... cannot read")`) must fall back
+  to the trace (`lift()` catches `SystemExit`).

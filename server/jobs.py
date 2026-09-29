@@ -48,6 +48,8 @@ _PHASES = [
     (re.compile(r"^\[\+\] result: "), "finish"),
 ]
 _OBF_LINE = re.compile(r"^\[\*\] obfuscator: (.+?)(?: \(detected, ([0-9.]+)\))?$")
+# "script error: ..." / "compile error: ..." = the script died while it ran (aborted/budget stops are normal)
+_RUN_STATUS = re.compile(r"^\[\*\] run status: (?:((?:script|compile) error.*)|.*)$")
 _FUNCS_LINE = re.compile(r"^\[\*\]\s+(\d+) functions,")   # the lifter's summary: "1867 functions, 0 unlifted blocks, ..."
 # First line of every deobfuscated file we return. WATERMARK="" turns it off. The engine's own
 # credit header ("Deobfuscated by ccjvwsod ...") stays below it.
@@ -55,6 +57,14 @@ WATERMARK = os.environ.get("WATERMARK", "deob by josz").strip()
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 MAX_LINE_CHARS = 2000
+
+
+# Luarmor V4 wrappers download the real script from Luarmor's servers (with each user's key) and
+# kick when run directly, so the tracer only sees a timeout: say what the file is instead.
+_LUARMOR = re.compile(r"Luarmor V4 bootstrapper", re.I)
+LUARMOR_NOTE = ("Es un cargador (wrapper) de Luarmor V4: baja el script real desde los servidores de Luarmor "
+                "con la clave de cada usuario y no funciona ejecutado solo. Este archivo no contiene nada que "
+                "deofuscar; hace falta el script que el cargador descarga.")
 
 
 def engine_available():
@@ -105,6 +115,8 @@ class Job:
         self.output = None
         self.detected_obfuscator = None
         self.confidence = None
+        self.loader_note = None    # set when the input is a known remote-script loader
+        self.run_error = None      # the script crashed in the sandbox: the result covers only what ran before
         self.functions = None      # functions the lifter rebuilt (devirtualized runs only)
         self.watermark = " ".join(WATERMARK.split()) or None   # first line added to the output
         self.error = None
@@ -136,6 +148,9 @@ class Job:
         if m:
             self.detected_obfuscator = m.group(1)
             self.confidence = float(m.group(2)) if m.group(2) else None
+        m = _RUN_STATUS.match(line)
+        if m:   # each traced run reports one: the last decides
+            self.run_error = m.group(1)[:300] if m.group(1) else None
         m = _FUNCS_LINE.match(line)
         if m:
             self.functions = int(m.group(1))   # the last one wins: it is the final round's
@@ -166,6 +181,7 @@ class Job:
             "detectedObfuscator": self.detected_obfuscator,
             "confidence": self.confidence,
             "functions": self.functions,
+            "runError": self.run_error,
             "error": self.error,
             "elapsedMs": self.elapsed_ms(),
         }
@@ -188,6 +204,8 @@ def create_job(source, filename, obfuscator, no_devirt, timeout, action):
 
     _prune()
     job = Job(filename, obfuscator, no_devirt, timeout, action)
+    if _LUARMOR.search(source[:4000]):
+        job.loader_note = LUARMOR_NOTE
     with _LOCK:
         _JOBS[job.id] = job
         _QUEUE.append(job.id)
@@ -238,6 +256,8 @@ def _reader(stream, sink):
 def _diagnose(job, code, oom_before):
     """A readable cause for a failed run; the engine's own message can be empty
     when the luau VM is killed from outside (it then only echoes luau's output)."""
+    if job.loader_note:
+        return job.loader_note
     oom_after = _oom_kills()
     if oom_before is not None and oom_after is not None and oom_after > oom_before:
         limit = memory_limit_mb()
@@ -272,6 +292,8 @@ def _run_job(job, source):
     job.status = "running"
     job.phase = "detect"
     job.started_at = time.time()
+    if job.loader_note:
+        job.append_log("[!] " + job.loader_note)
     discord.notify_started(job)
 
     workdir = tempfile.mkdtemp(prefix="deobjob_")

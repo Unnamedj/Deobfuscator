@@ -212,7 +212,8 @@
 
   function renderStats(d) {
     const chips = [];
-    if (d.status === "done") chips.push(`<span class="stat ok">Completado</span>`);
+    if (d.status === "done" && d.runError) chips.push(`<span class="stat warn" title="${esc(d.runError)}">Resultado parcial: el script falló al ejecutarse</span>`);
+    else if (d.status === "done") chips.push(`<span class="stat ok">Completado</span>`);
     else if (d.status === "cancelled") chips.push(`<span class="stat">Cancelado</span>`);
     else chips.push(`<span class="stat err">Error</span>`);
     if (d.detectedObfuscator) {

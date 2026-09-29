@@ -377,6 +377,10 @@ def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths,
         return runner.run(patched, c, chunks)
     try:
         devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths, live, devirt_module)
+    except SystemExit as e:
+        # devirtualize() gives up with sys.exit("[!] ...") when it cannot read the VM at all:
+        # that must fall back to the trace below, not end the whole run without a result
+        print(e.code if isinstance(e.code, str) else "[!] devirtualization gave up", file=sys.stderr)
     except Exception as e:
 
         print("[!] devirtualization failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)

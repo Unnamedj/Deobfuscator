@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
-COLORS = {"start": 0x5865F2, "done": 0x57F287, "error": 0xED4245, "cancelled": 0x8A92A6}
+COLORS = {"start": 0x5865F2, "done": 0x57F287, "warn": 0xFEE75C, "error": 0xED4245, "cancelled": 0x8A92A6}
 PREVIEW_LINES = 6
 PREVIEW_MAX_CHARS = 900
 
@@ -165,12 +165,17 @@ def notify_finished(job):
     output = job.output or ""
     data = output.encode("utf-8")
     fits = len(data) <= MAX_ATTACHMENT_BYTES
+    warn = job.run_error
     desc = "Your cleaned script is attached below." if fits else \
         "The result is %d KB, too big to attach here: download it from the web page." % (len(data) // 1024)
+    if warn:
+        desc = ("The script crashed while running in the sandbox, so the result only covers what ran before "
+                "that. " + desc)
     desc += "\n" + _kv(
         ("Input", "`%s`" % job.filename),
         ("Obfuscator", _obfuscator(job)),
         ("Mode", _mode(job)),
+        ("Warning", "`%s`" % warn[:200].replace("`", "'") if warn else None),
         ("Watermark", "🏷️ %s" % job.watermark if job.watermark else None),
         ("Functions", "{:,}".format(job.functions) if job.functions is not None else None),
         ("Lines", "{:,}".format(output.count("\n") + 1)),
@@ -183,6 +188,8 @@ def notify_finished(job):
     detection = _embed(
         "✅ Detection complete", COLORS["done"],
         _kv(("Obfuscator", _obfuscator(job)), ("Status", status)), _footer(job))
-    message = _message(_embed("✅ Deobfuscation complete", COLORS["done"], desc, _footer(job)), detection)
+    main = _embed("⚠️ Deobfuscation finished with warnings" if warn else "✅ Deobfuscation complete",
+                  COLORS["warn"] if warn else COLORS["done"], desc, _footer(job))
+    message = _message(main, detection)
     base = job.filename.rsplit(".", 1)[0] or "output"
     _send(message, attachment=("%s_deobf.lua" % base, data) if fits else None)
