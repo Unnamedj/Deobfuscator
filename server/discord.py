@@ -101,6 +101,11 @@ def _footer(job):
     return "Luau Deobfuscator" + (" · %s" % job.watermark if job.watermark else "")
 
 
+def _src(job):
+    """host/path of the link the script was downloaded from (never the query string: it can hold a token)."""
+    return "`%s`" % job.source_label[:100].replace("`", "'") if job.source_label else None
+
+
 def _secs(ms):
     return "%.1fs" % (ms / 1000)
 
@@ -133,10 +138,10 @@ def _preview(output):
 
 def notify_started(job):
     if job.action == "detect":
-        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)))
+        desc = _kv(("Input", "`%s`" % job.filename), ("Source", _src(job)), ("Obfuscator", _obfuscator(job)))
         _send(_message(_embed("🔍 Detection started", COLORS["start"], desc, _footer(job))))
         return
-    desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Mode", _mode(job)))
+    desc = _kv(("Input", "`%s`" % job.filename), ("Source", _src(job)), ("Obfuscator", _obfuscator(job)), ("Mode", _mode(job)))
     _send(_message(_embed("⚙️ Deobfuscation started", COLORS["start"], desc, _footer(job))))
 
 
@@ -144,13 +149,13 @@ def notify_finished(job):
     elapsed = _secs(job.elapsed_ms())
 
     if job.status == "cancelled":
-        desc = _kv(("Input", "`%s`" % job.filename), ("Time", elapsed))
+        desc = _kv(("Input", "`%s`" % job.filename), ("Source", _src(job)), ("Time", elapsed))
         _send(_message(_embed("⏹️ Job cancelled", COLORS["cancelled"], desc, _footer(job))))
         return
 
     if job.status != "done":
         tail = "\n".join(job.log[-8:])[-1200:].replace("```", "`​``")
-        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
+        desc = _kv(("Input", "`%s`" % job.filename), ("Source", _src(job)), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
         desc += "\n\n**Reason**\n%s" % (job.error or "Unknown error")
         if tail:
             desc += "\n```\n%s\n```" % tail
@@ -158,7 +163,7 @@ def notify_finished(job):
         return
 
     if job.action == "detect":
-        desc = _kv(("Input", "`%s`" % job.filename), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
+        desc = _kv(("Input", "`%s`" % job.filename), ("Source", _src(job)), ("Obfuscator", _obfuscator(job)), ("Time", elapsed))
         _send(_message(_embed("✅ Detection complete", COLORS["done"], desc, _footer(job))))
         return
 
@@ -172,7 +177,7 @@ def notify_finished(job):
         desc = ("The script crashed while running in the sandbox, so the result only covers what ran before "
                 "that. " + desc)
     desc += "\n" + _kv(
-        ("Input", "`%s`" % job.filename),
+        ("Input", "`%s`" % job.filename), ("Source", _src(job)),
         ("Obfuscator", _obfuscator(job)),
         ("Mode", _mode(job)),
         ("Warning", "`%s`" % warn[:200].replace("`", "'") if warn else None),

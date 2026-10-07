@@ -34,10 +34,21 @@ samples/                  scripts de ejemplo (la web los ofrece en "Ejemplos…"
 | Método | Ruta | Qué hace |
 |---|---|---|
 | `GET` | `/api/health` | Motor disponible, Discord configurado, trabajos en curso/en cola |
-| `POST` | `/api/jobs` | Crea un trabajo (`action`: `deobfuscate` \| `detect`) y responde al toque con su `id` |
+| `POST` | `/api/jobs` | Crea un trabajo (`action`: `deobfuscate` \| `detect`) y responde al toque con su `id`. El script va en `source` (texto) **o** en `url` (el servidor lo descarga) |
 | `GET` | `/api/jobs/{id}` | Estado, fase (`queued` → `detect` → `trace` → `devirt` → `finish`), registro y resultado |
 | `POST` | `/api/jobs/{id}/cancel` | Cancela (mata `deob.py` y todos sus procesos `luau`) |
 | `GET` | `/api/samples`, `/api/samples/{name}` | Ejemplos incluidos |
+
+### Deofuscar desde un enlace
+
+En vez de copiar y pegar, la web acepta un enlace al script (campo sobre el editor, o `url` en la API):
+GitHub raw / blob, Gist, GitLab, Pastebin y archivos de Discord (`cdn.discordapp.com`). Las páginas de GitHub,
+Gist y Pastebin se convierten solas a su versión en bruto.
+
+Como es el servidor quien descarga, solo se permiten **https y esos sitios**: sin IPs, sin `localhost`, sin
+usuario/puerto, y las redirecciones se revisan con las mismas reglas (para que nadie use la web para
+pedirle cosas a la red interna). Tope de 2 MB y 20 s. Para añadir más sitios: `FETCH_ALLOWED_HOSTS`
+(lista separada por comas). En Discord aparece el origen como `host/ruta`, nunca con la parte `?token=…`.
 
 ### Marca de agua y mensaje de Discord
 

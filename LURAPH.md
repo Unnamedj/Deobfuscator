@@ -349,6 +349,13 @@ removes Luraph's Path2D/Folder probe block at the top.
 - Without the long-lived harness, constant rounds converge one nesting
   level per round. Loader VM roots can't be lifted (`storing a non-empty VM
   table into a register`).
+- **Newer Luraph v15 build** (`return({fg=bit32.rshift,Sh=function(R,D,i,j,e)...`, dispatch loops written
+  `repeat Y,D=R:Xh(...) ... until false` that call state methods; also zap_3's `return setmetatable({...}):Z2(...)`):
+  `vmmap.find_dispatchers` finds none (logic.lua) or no closure makers (zap_3), so `patch_entries` hooks nothing
+  and the lift gives up (falls back to the trace). logic.lua (446 KB) also never leaves its first loop in the
+  harness: 170 s of CPU, no output, no environment call, so no spin heartbeat; the loop is not one of the
+  `while true do local op=ARR[pc]` heads `patch_spin` counts. Counting the new `repeat` heads did not change
+  it (tested, not kept). Needs its own front end; a likely cause is an environment check the harness fails.
 - **Luarmor V4 chains** (zap_1/2/3): the wrapper (`Luarmor V4 bootstrapper`, detect 0.01) kicks when run
   directly and fetches the real script from Luarmor's servers, so there is nothing to deobfuscate in
   it (the web app says so). Stage 1 (Luraph v15, 0.80) `loadstring`s stage 2 (a VM with no payload of

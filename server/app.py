@@ -23,6 +23,7 @@ def _load_dotenv(path):
 _load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 import hashlib  # noqa: E402
+from typing import Optional  # noqa: E402
 
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import HTMLResponse, PlainTextResponse  # noqa: E402
@@ -73,7 +74,8 @@ SAMPLE_LABELS = {"-obfuscated.lua": "Luraph v15", "-ib1.lua": "IronBrew 1"}
 
 class JobRequest(BaseModel):
     action: str = "deobfuscate"
-    source: str
+    source: str = ""                 # the script text, or...
+    url: Optional[str] = None        # ...a link the server downloads it from (wins over `source`)
     filename: str = "script.lua"
     obfuscator: str = "auto-detect"
     noDevirt: bool = False
@@ -117,13 +119,13 @@ def get_sample(name: str):
 
 @app.post("/api/jobs")
 def create_job(req: JobRequest):
-    if not req.source.strip():
-        raise HTTPException(400, "El script está vacío.")
+    if not req.url and not req.source.strip():
+        raise HTTPException(400, "Pega el script o un enlace a él.")
     if not jobs.engine_available():
         raise HTTPException(503, "El motor no está disponible en el servidor.")
     try:
         job = jobs.create_job(
-            req.source, req.filename, req.obfuscator, req.noDevirt, req.timeout, req.action
+            req.source, req.filename, req.obfuscator, req.noDevirt, req.timeout, req.action, req.url
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

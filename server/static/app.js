@@ -12,7 +12,7 @@
     stats: $("stats"), copyBtn: $("copy-btn"), downloadBtn: $("download-btn"), wrapBtn: $("wrap-btn"),
     empty: $("empty-state"), code: $("code"), gutter: $("gutter"), codeBody: $("code-body"),
     outputView: $("output-view"), logView: $("log-view"), logBody: $("log-body"), logCount: $("log-count"),
-    toasts: $("toasts"),
+    toasts: $("toasts"), url: $("url-input"),
     pillEngine: $("pill-engine"), pillDiscord: $("pill-discord"), pillQueue: $("pill-queue"),
   };
 
@@ -101,19 +101,36 @@
   }
 
   // ---------- input ----------
+  // The script comes from the editor OR from a link, never both: filling one empties the other.
   function setSource(text, name) {
     el.source.value = text;
+    if (text) el.url.value = "";
     if (name) filename = name;
     updateSourceMeta();
   }
 
+  function urlFilename(u) {
+    try {
+      const last = decodeURIComponent(new URL(u).pathname.split("/").pop() || "");
+      const name = last.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+|[._]+$/g, "");
+      return name && name !== "raw" ? (name.includes(".") ? name : name + ".lua") : "script.lua";
+    } catch { return "script.lua"; }
+  }
+
   function updateSourceMeta() {
     const text = el.source.value;
+    const link = el.url.value.trim();
     const lines = text ? text.split("\n").length : 0;
     const size = new Blob([text]).size;
-    el.srcStats.textContent = `${lines.toLocaleString("es")} líneas · ${kb(size)}`;
-    el.fileMeta.textContent = text ? filename : "Pega el código o suelta un archivo";
+    el.srcStats.textContent = link ? "El servidor descargará el enlace al deofuscar" : `${lines.toLocaleString("es")} líneas · ${kb(size)}`;
+    el.fileMeta.textContent = link ? `Enlace → ${urlFilename(link)}` : text ? filename : "Pega el código, un enlace o suelta un archivo";
   }
+
+  el.url.addEventListener("input", () => {
+    if (el.url.value.trim()) el.source.value = "";
+    updateSourceMeta();
+  });
+  el.url.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); run("deobfuscate"); } });
 
   function readFile(f) {
     if (!f) return;
@@ -121,7 +138,10 @@
     f.text().then((t) => { setSource(t, f.name); toast(`${f.name} cargado`, "ok"); });
   }
 
-  el.source.addEventListener("input", updateSourceMeta);
+  el.source.addEventListener("input", () => {
+    if (el.source.value) el.url.value = "";
+    updateSourceMeta();
+  });
   el.source.addEventListener("keydown", (e) => {
     if (e.key === "Tab") {
       e.preventDefault();
@@ -132,7 +152,7 @@
   });
   $("upload-btn").addEventListener("click", () => el.fileInput.click());
   el.fileInput.addEventListener("change", () => { readFile(el.fileInput.files[0]); el.fileInput.value = ""; });
-  $("clear-btn").addEventListener("click", () => { filename = "script.lua"; setSource(""); el.source.focus(); });
+  $("clear-btn").addEventListener("click", () => { filename = "script.lua"; el.url.value = ""; setSource(""); el.source.focus(); });
   el.samples.addEventListener("change", () => { if (el.samples.value) loadSample(el.samples.value); el.samples.value = ""; });
   $("try-sample").addEventListener("click", (e) => {
     e.preventDefault();
@@ -235,7 +255,7 @@
     const skip = new Set();
     if (d.action === "detect") { skip.add("trace"); skip.add("devirt"); }
     else if (d.noDevirt) skip.add("devirt");
-    const idx = PHASES.indexOf(d.phase);
+    const idx = d.phase === "fetch" ? 0 : PHASES.indexOf(d.phase);   // downloading counts as still waiting
     el.stepper.querySelectorAll("li").forEach((li, i) => {
       const p = li.dataset.phase;
       li.className = skip.has(p) ? "skipped" : i < idx ? "done" : i === idx ? "active" : "";
@@ -245,11 +265,11 @@
       el.progressTitle.textContent = d.queuePosition ? `En cola · posición ${d.queuePosition}` : "En cola…";
     } else {
       el.progressTitle.textContent = d.action === "detect" ? "Detectando ofuscador…" : {
-        detect: "Detectando ofuscador…", trace: "Ejecutando en la VM de Luau…",
+        fetch: "Descargando el script…", detect: "Detectando ofuscador…", trace: "Ejecutando en la VM de Luau…",
         devirt: "Devirtualizando bytecode…", finish: "Terminando…",
       }[d.phase] || "Procesando…";
     }
-    el.progressSub.textContent = `${filename} · ${OBF_LABEL[d.obfuscator] || d.obfuscator}${d.detectedObfuscator ? ` → ${d.detectedObfuscator}` : ""}`;
+    el.progressSub.textContent = `${d.sourceUrl || filename} · ${OBF_LABEL[d.obfuscator] || d.obfuscator}${d.detectedObfuscator ? ` → ${d.detectedObfuscator}` : ""}`;
     const last = [...d.log].reverse().find((l) => !l.startsWith("$"));
     el.liveLine.textContent = last || "Esperando al motor…";
     startedAt = Date.now() - d.elapsedMs;
@@ -270,10 +290,13 @@
     if (job) return;
     if (!engineOk) return toast("El motor no está disponible", "err");
     const source = el.source.value;
-    if (!source.trim()) { el.source.focus(); return toast("Pega o sube un script primero", "err"); }
+    const link = el.url.value.trim();
+    if (!source.trim() && !link) { el.source.focus(); return toast("Pega un script, un enlace o sube un archivo", "err"); }
+    if (link) filename = urlFilename(link);
 
     const body = {
-      action, source, filename,
+      action, filename,
+      ...(link ? { url: link } : { source }),
       obfuscator: radio("obf"), noDevirt: radio("mode") === "fast", timeout: Number(el.timeout.value),
     };
     startedAt = Date.now();
@@ -322,6 +345,7 @@
     setBusy(false);
     refreshHealth();
     if (!d) return;
+    if (d.filename) filename = d.filename;   // a downloaded script is named by its link: keep it for "Descargar"
     renderStats(d);
     if (d.status === "done") {
       if (d.action === "detect") {

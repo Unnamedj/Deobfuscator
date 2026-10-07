@@ -173,6 +173,14 @@ main { max-width: 1240px; margin: 0 auto; padding: 0 20px 40px; }
 
 /* ---------- editor ---------- */
 .input-card { display: flex; flex-direction: column; min-height: 460px; position: relative; }
+.url-row { display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--line); color: var(--text-3); }
+.url-row svg { width: 17px; height: 17px; }
+.url-row input {
+  flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--text);
+  font: 13px var(--mono); padding: 4px 0;
+}
+.url-row input::placeholder { color: var(--text-3); font-family: inherit; }
+.url-row:focus-within { color: var(--violet); }
 .editor-wrap { position: relative; flex: 1; display: flex; }
 #source {
   flex: 1; width: 100%; min-height: 320px; resize: none; border: 0; outline: none;

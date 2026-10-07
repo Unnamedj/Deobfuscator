@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 
-from . import discord
+from . import discord, fetch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEOB_PY = os.path.join(REPO_ROOT, "deobf", "deob.py")
@@ -115,6 +115,8 @@ class Job:
         self.output = None
         self.detected_obfuscator = None
         self.confidence = None
+        self.url = None            # validated link to download the script from (instead of pasted text)
+        self.source_label = None   # host/path of that link, without the query string
         self.loader_note = None    # set when the input is a known remote-script loader
         self.run_error = None      # the script crashed in the sandbox: the result covers only what ran before
         self.functions = None      # functions the lifter rebuilt (devirtualized runs only)
@@ -171,6 +173,7 @@ class Job:
             "id": self.id,
             "action": self.action,
             "filename": self.filename,
+            "sourceUrl": self.source_label,
             "obfuscator": self.obfuscator,
             "noDevirt": self.no_devirt,
             "status": self.status,
@@ -194,17 +197,25 @@ def _prune():
             del _JOBS[jid]
 
 
-def create_job(source, filename, obfuscator, no_devirt, timeout, action):
-    if len(source.encode("utf-8", errors="ignore")) > MAX_SOURCE_BYTES:
-        raise ValueError("Script demasiado grande (máx. %d KB)." % (MAX_SOURCE_BYTES // 1000))
+def create_job(source, filename, obfuscator, no_devirt, timeout, action, url=None):
     if action not in ("deobfuscate", "detect"):
         raise ValueError("Acción inválida.")
     if obfuscator not in OBFUSCATORS:
         raise ValueError("Ofuscador desconocido.")
+    if url:
+        try:
+            url = fetch.normalize(url)   # rejects bad links now; the download itself runs in the job
+        except fetch.FetchError as exc:
+            raise ValueError(str(exc)) from exc
+        filename, source = fetch.filename_for(url), ""
+    elif len(source.encode("utf-8", errors="ignore")) > MAX_SOURCE_BYTES:
+        raise ValueError("Script demasiado grande (máx. %d KB)." % (MAX_SOURCE_BYTES // 1000))
 
     _prune()
     job = Job(filename, obfuscator, no_devirt, timeout, action)
-    if _LUARMOR.search(source[:4000]):
+    if url:
+        job.url, job.source_label = url, fetch.display(url)
+    elif _LUARMOR.search(source[:4000]):
         job.loader_note = LUARMOR_NOTE
     with _LOCK:
         _JOBS[job.id] = job
@@ -268,6 +279,9 @@ def _diagnose(job, code, oom_before):
         return msg
     if code == -9:
         return "El trabajo superó el tiempo máximo del servidor."
+    if any(line.startswith("[!] timed out after") for line in job.log):
+        return ("El script no terminó dentro del entorno simulado: se quedó en un bucle sin fin. Suele ser una "
+                "comprobación anti-manipulación de una versión de Luraph que el motor todavía no entiende.")
     if any(line == "[!]" for line in job.log):
         msg = ("La VM de Luau se cerró de golpe sin mensaje de error: casi siempre es falta de memoria "
                "del servidor (o un crash nativo del script).")
@@ -299,9 +313,26 @@ def _run_job(job, source):
     workdir = tempfile.mkdtemp(prefix="deobjob_")
     stdout_lines = []
     try:
+        if job.url:
+            job.phase = "fetch"
+            job.append_log("[*] descargando %s" % job.source_label)
+            try:
+                data, _ = fetch.download(job.url, MAX_SOURCE_BYTES)
+            except fetch.FetchError as exc:
+                job.status, job.error = "error", str(exc)
+                job.append_log("[!] %s" % exc)
+                return
+            job.append_log("[*] descargados %d KB" % -(-len(data) // 1000))
+            job.phase = "detect"
+            if _LUARMOR.search(data[:4000].decode("latin-1")):
+                job.loader_note = LUARMOR_NOTE
+                job.append_log("[!] " + LUARMOR_NOTE)
+        else:
+            # the engine reads the file as bytes: a pasted (Unicode) script goes in as UTF-8, like a real file
+            data = source.encode("utf-8", errors="replace")
         in_path = os.path.join(workdir, job.filename)
         with open(in_path, "wb") as f:
-            f.write(source.encode("latin-1", errors="replace"))
+            f.write(data)
 
         out_path = os.path.join(workdir, "out.lua")
         cmd = [sys.executable, DEOB_PY, in_path, "--timeout", str(job.timeout)]
