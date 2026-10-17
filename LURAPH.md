@@ -356,6 +356,14 @@ removes Luraph's Path2D/Folder probe block at the top.
   harness: 170 s of CPU, no output, no environment call, so no spin heartbeat; the loop is not one of the
   `while true do local op=ARR[pc]` heads `patch_spin` counts. Counting the new `repeat` heads did not change
   it (tested, not kept). Needs its own front end; a likely cause is an environment check the harness fails.
+- **ZEUS-protected scripts** (`("ZEUS"):gsub(".+",function(o)_trlb6R=o end)return(function(q,z,o,t,...)`) are
+  not Luraph (detect: generic 0.01, trace only). Their VM reads canary globals (`o.RV3DUvytiGOISv`) for a free
+  nil; as proxies they made the run die at once ("arithmetic on number and nil", 0 statements): see
+  `CHAIN.canary` in envlog. After that the script runs and calls `Players.LocalPlayer:Kick("... modden")` right
+  after reading `game.PlaceId` twice and calling `MarketplaceService:GetProductInfo(game.PlaceId)` (never
+  reads the result). Kick still fires with another PlaceId, with `falsy=GetProductInfo`, and with the
+  call raising: the check is elsewhere (an environment fingerprint?). Not solved. Do NOT make
+  `GetProductInfo(0)` raise: scripts that read their own place's info (PlaceId is 0 here) would abort.
 - **Luarmor V4 chains** (zap_1/2/3): the wrapper (`Luarmor V4 bootstrapper`, detect 0.01) kicks when run
   directly and fetches the real script from Luarmor's servers, so there is nothing to deobfuscate in
   it (the web app says so). Stage 1 (Luraph v15, 0.80) `loadstring`s stage 2 (a VM with no payload of

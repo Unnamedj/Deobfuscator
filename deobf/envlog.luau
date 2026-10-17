@@ -4172,6 +4172,43 @@ end
 markC(E)
 CFUNCS[E.debug.info] = true
 
+-- An obfuscator's canary global (`o.mmQ8sBTylJYLo`, `o.RV3DUvytiGOISv`, `o.qCDKaYjMgRMO`): random
+-- letters/digits, read to get a nil that costs nothing (the end of a VM loop, a tamper branch's exit).
+-- A proxy there derails the VM ("arithmetic on number and nil", "compare userdata < number" later).
+-- Not a word: alphanumeric, 11+ long, no lowercase run past 4 ("Service", "bject"), many case flips
+-- (6+; 3+ with a digit), and never a name of the Roblox API data (a shape test alone also matches
+-- about 2% of the member/enum names: ClearTextOnFocus). Executor functions are lowercase words
+-- (`getconnections`). (A CHAIN field: the top-level chunk has no locals left; cached per name.)
+CHAIN.canaries = {}
+CHAIN.canary = function(k)
+	local known = CHAIN.canaries[k]
+	if known ~= nil then return known end
+	local c = false
+	if #k >= 11 and not R.find(k, "[^%w]") then
+		local flips, prev, run = 0, nil, 0
+		c = true
+		for i = 1, #k do
+			local b = R.byte(k, i)
+			local up
+			if b >= 65 and b <= 90 then up = true elseif b >= 97 and b <= 122 then up = false end
+			if up == false then
+				run += 1
+				if run > 4 then c = false break end
+			else
+				run = 0
+			end
+			if up ~= nil then
+				if prev ~= nil and up ~= prev then flips += 1 end
+				prev = up
+			end
+		end
+		c = c and (flips >= 6 or (flips >= 3 and R.find(k, "%d") ~= nil))
+		if c and __ROBLOX and (R.find(__ROBLOX.enums, k, 1, true) or R.find(__ROBLOX.classes, k, 1, true)) then c = false end
+	end
+	CHAIN.canaries[k] = c
+	return c
+end
+
 -- anything else resolves to a named proxy so executor APIs etc. show up
 local unknownGlobals = {}
 R.setmetatable(ENV, {
@@ -4180,6 +4217,7 @@ R.setmetatable(ENV, {
 		-- a hash-like name (`_54776ae771af02794d46e80d`) is an obfuscator's
 		-- run-once/cache key, never an API: nil, as in a fresh Roblox state
 		if #k >= 12 and R.match(k, "^_*%x+$") and R.find(k, "%d") then return nil end
+		if CHAIN.canary(k) then return nil end
 		local p = globalP(k, "function")
 		if CFG.ptrace then R.print("[unknown-global]", k) end
 		remember(unknownGlobals, k)
