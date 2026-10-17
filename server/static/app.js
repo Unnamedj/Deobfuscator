@@ -17,7 +17,7 @@
   };
 
   const PHASES = ["queued", "detect", "trace", "devirt", "finish"];
-  const OBF_LABEL = { "auto-detect": "Auto", luraph_v15: "Luraph v15", ironbrew1: "IronBrew 1", hydra: "HYDRA", generic: "Genérico" };
+  const OBF_LABEL = { "auto-detect": "Auto", luraph_v15: "Luraph v15", ironbrew1: "IronBrew 1", zeus: "ZEUS", hydra: "HYDRA", generic: "Genérico" };
   const MODE_HINT = {
     full: "Devirtualiza el bytecode: recupera ramas y funciones completas. Puede tardar minutos.",
     fast: "Solo traza lo que el script hace al ejecutarse. Segundos, pero sin ramas no ejecutadas.",

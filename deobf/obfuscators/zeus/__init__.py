@@ -18,6 +18,11 @@ TAIL = re.compile(r"\(\s*newproxy\s*,\s*select\s*,\s*getfenv and getfenv\(\)\s*o
                   r"\s*,\s*setmetatable\s*,\s*getmetatable\s*,\s*\{\s*\.\.\.\s*\}\s*\)\s*$")
 
 
+def text_strings_done(prog):
+    """Were string constants decrypted (so the decryptor's set-up code is dead)?"""
+    return bool(getattr(prog, "strings", None))
+
+
 class Zeus(Obfuscator):
     name = "zeus"
     label = "ZEUS"
@@ -36,6 +41,8 @@ class Zeus(Obfuscator):
         g = ap.add_argument_group("ZEUS")
         g.add_argument("--zeus-keep-strings", action="store_true",
                        help="leave the string constants encrypted (skip running the script's decryptor)")
+        g.add_argument("--zeus-keep-protection", action="store_true",
+                       help="keep ZEUS's own anti-tamper gate around the script")
 
     def deobfuscate(self, job):
         args = job.args
@@ -63,12 +70,53 @@ class Zeus(Obfuscator):
         st = prog.stats
         print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps (%.1fs)"
               % (st["functions"], st["errors"], st["fallbacks"], time.time() - t0), file=sys.stderr)
+        if not getattr(job.args, "zeus_keep_protection", False):
+            text = backend.run_big_stack(self.ungate, text)
+        text = backend.run_big_stack(self.loops, text)
+        if text_strings_done(prog):
+            text = backend.run_big_stack(self.dead_setup, text)
         text = backend.run_big_stack(lambda: backend.finish_text(backend.polish(text)))
         header = (job.credit_header() +
                   "-- Local names are inferred from use (the original names are not in the bytecode)\n")
         path = job.trace_path.replace(".deobf.luau", ".devirt.luau") if job.debug else job.trace_path
         job.write(path, header + "\n" + text + "\n")
         return path
+
+    @staticmethod
+    def ungate(text):
+        """The script out of ZEUS's anti-tamper gate (gate.py)."""
+        from obfuscators.zeus import gate
+        try:
+            new, done = gate.unwrap(text)
+        except Exception as e:  # noqa: BLE001 - keep the gate
+            print("[!] gate removal failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+            return text
+        print("[*]   anti-tamper gate %s" % ("removed" if done else "kept (not the expected shape)"), file=sys.stderr)
+        return new
+
+    @staticmethod
+    def dead_setup(text):
+        """The string decryptor's set-up code, dead once the strings are decrypted (prelude.py)."""
+        from obfuscators.zeus import prelude
+        try:
+            new, n = prelude.clean(text)
+        except Exception as e:  # noqa: BLE001 - keep it
+            print("[!] set-up removal failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+            return text
+        print("[*]   %d dead set-up statements removed" % n, file=sys.stderr)
+        return new
+
+    @staticmethod
+    def loops(text):
+        """`while true do` loops back into `for` loops (looptext.py)."""
+        from obfuscators.zeus import looptext
+        try:
+            new, n = looptext.rewrite(text)
+        except Exception as e:  # noqa: BLE001 - keep the loops as they are
+            print("[!] for-loop recovery failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+            return text
+        print("[*]   %d loops written back as for" % n, file=sys.stderr)
+        return new
 
     def fallback(self, job, why):
         import obfuscators

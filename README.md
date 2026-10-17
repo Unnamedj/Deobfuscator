@@ -88,7 +88,7 @@ uvicorn server.app:app --reload --port 8000   # http://localhost:8000
 
 ## Límites conocidos
 
-- Detecta `luraph_v15`, `ironbrew1` y `hydra` (empaquetadores `loadstring` por
+- Detecta `luraph_v15`, `ironbrew1`, `zeus` (devirtualiza sin ejecutar el script) y `hydra` (empaquetadores `loadstring` por
   capas: se pelan sin ejecutar el payload y el resultado va al ofuscador de
   dentro); el resto cae a `generic` (solo trace, sin devirtualización).
 - El trace no incluye ramas que no se ejecutaron (la salida devirtualizada sí).

@@ -32,6 +32,7 @@ there, never here; this file only holds what all plugins share.
 |---|---|---|
 | `luraph_v15` | `LURAPH.md` | Devirtualizer + trace |
 | `ironbrew1` | `IRONBREW1.md` | Devirtualizer + trace. Samples: `*-ib1.lua` (all with sources). |
+| `zeus` | `ZEUS.md` | Static devirtualizer (state-machine dispatcher); the script is never run. |
 | `hydra` | `HYDRA.md` | Loadstring packer layers: peeled, inner payload goes to its plugin. |
 | `generic` | (none) | Fallback for undetected inputs: behaviour trace only. |
 
