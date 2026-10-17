@@ -88,8 +88,9 @@ uvicorn server.app:app --reload --port 8000   # http://localhost:8000
 
 ## Límites conocidos
 
-- Detecta `luraph_v15` e `ironbrew1`; el resto cae a `generic` (solo trace,
-  sin devirtualización).
+- Detecta `luraph_v15`, `ironbrew1` y `hydra` (empaquetadores `loadstring` por
+  capas: se pelan sin ejecutar el payload y el resultado va al ofuscador de
+  dentro); el resto cae a `generic` (solo trace, sin devirtualización).
 - El trace no incluye ramas que no se ejecutaron (la salida devirtualizada sí).
 - Discord no admite adjuntos de más de 8 MB: en ese caso el mensaje avisa
   y el archivo se descarga desde la web.

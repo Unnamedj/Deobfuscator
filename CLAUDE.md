@@ -32,6 +32,7 @@ there, never here; this file only holds what all plugins share.
 |---|---|---|
 | `luraph_v15` | `LURAPH.md` | Devirtualizer + trace |
 | `ironbrew1` | `IRONBREW1.md` | Devirtualizer + trace. Samples: `*-ib1.lua` (all with sources). |
+| `hydra` | `HYDRA.md` | Loadstring packer layers: peeled, inner payload goes to its plugin. |
 | `generic` | (none) | Fallback for undetected inputs: behaviour trace only. |
 
 ## Folder layout
@@ -428,8 +429,9 @@ hold for every change to the shared runtime:
   Conditions on unknown values follow default guesses: proxies are
   truthy, `<` assumed true, numeric properties 0 or typical values.
 - **Remote code isn't followed:** `HttpGet` + `loadstring` is recorded, never fetched.
-- Layered protection (one obfuscator's output obfuscated again, or a
-  loader that loadstrings another obfuscator's chunk) isn't detected per layer.
+- Layered protection is only handled for plain `loadstring` packers (`hydra`
+  plugin). An obfuscator whose output is obfuscated again by a VM, or a loader
+  that loadstrings another obfuscator's chunk at run time, isn't detected per layer.
 - **Path2D model:** assumes an offset-only parent Frame Size (every probe seen);
   a Scale size or unmodelled method prints a warning: then `--studio` once.
 - `setmetatable(randomObj, {})` says "got userdata" (Roblox: "got Random"); wrapping `setmetatable` is unsafe.

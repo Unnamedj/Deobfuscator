@@ -224,6 +224,7 @@ select option { background: var(--surface-solid); }
 .field { border: 0; margin: 0; padding: 0; min-width: 0; }
 .field legend, .range-head label { font-size: 12.5px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; padding: 0; }
 .choice-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.choice-grid .choice:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .choice { position: relative; cursor: pointer; }
 .choice input { position: absolute; opacity: 0; pointer-events: none; }
 .choice span {

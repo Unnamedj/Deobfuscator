@@ -33,7 +33,7 @@ HARD_KILL_SECONDS = int(os.environ.get("HARD_KILL_SECONDS", str(20 * 60)))
 JOB_TTL_SECONDS = 60 * 60
 MAX_LOG_LINES = 2000
 
-OBFUSCATORS = ("auto-detect", "luraph_v15", "ironbrew1", "generic")
+OBFUSCATORS = ("auto-detect", "luraph_v15", "ironbrew1", "hydra", "generic")
 
 _JOBS = {}
 _QUEUE = []
