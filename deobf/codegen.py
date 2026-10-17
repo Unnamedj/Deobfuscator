@@ -93,7 +93,7 @@ def map_expr(e, fn):
     if isinstance(e, IfExp):
         return IfExp(map_expr(e.c, fn), map_expr(e.a, fn), map_expr(e.b, fn))
     if isinstance(e, CallE):
-        return CallE(map_expr(e.fn, fn), map_multi(e.args, fn), e.method)
+        return CallE(map_expr(e.fn, fn), map_multi(e.args, fn), e.method, e.droppable)
     if isinstance(e, NewTableE):
         return NewTableE([(map_expr(k, fn) if k is not None else None, map_expr(v, fn)) for k, v in e.items],
                          map_tail(e.tail, fn))
@@ -136,8 +136,9 @@ class InlineTail:
 class CallE(Expr):
     pure = False
 
-    def __init__(self, fn, args, method=None):
+    def __init__(self, fn, args, method=None, droppable=False):
         self.fn, self.args, self.method = fn, args, method
+        self.droppable = droppable     # a front end knows nobody needs the call (no side effects, result unused)
 
 
 class NewTableE(Expr):
@@ -187,7 +188,7 @@ def temps_read(e):
 
 
 def has_side_effects(e):
-    return any(isinstance(x, CallE) for x in walk(e))
+    return any(isinstance(x, CallE) and not x.droppable for x in walk(e))
 
 
 def expr_key(e):
@@ -251,7 +252,8 @@ def convert_stmts(stmts, D):
     out = []
     for st in stmts:
         if isinstance(st, D.CallStmt):
-            out.append(TempDef(st.t, CallE(conv(st.fn, D), conv_multi(st.args, D))))
+            out.append(TempDef(st.t, CallE(conv(st.fn, D), conv_multi(st.args, D), None,
+                                           getattr(st, "droppable", False))))
         elif isinstance(st, D.SetList):
             out.append(SetListS(conv(st.tbl, D), st.start, conv_multi(st.values, D)))
         elif isinstance(st, D.Close):
@@ -433,7 +435,8 @@ def simplify_block(b, live_out, temp_uses_total, open_in=frozenset()):
         if isinstance(s, TempDef):
             n_uses = temp_uses_total.get(s.t, 0)
             if n_uses == 0:
-                out.append(CallS(s.call))
+                if not s.call.droppable:
+                    out.append(CallS(s.call))
                 i += 1
                 continue
             # consecutive `rX = T[1]; rY = T[2] ...` (all uses of t)

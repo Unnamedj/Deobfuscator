@@ -349,7 +349,7 @@ def rename(entry, blocks, prefix, captured):
                     keep.append(None)
                     continue
                 if vals.tail is not None and not vals.items and isinstance(vals.tail, CG.InlineTail):
-                    keep.append(CG.CallS(vals.tail.call))
+                    keep.append(None if vals.tail.call.droppable else CG.CallS(vals.tail.call))
                     continue
                 if len(vals.items) == 1 and vals.tail is None and isinstance(vals.items[0], CG.CallE):
                     keep.append(CG.CallS(vals.items[0]))

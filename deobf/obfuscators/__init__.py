@@ -9,12 +9,14 @@ confident; `--obfuscator NAME` forces one.
 from obfuscators.base import Obfuscator, Job  # noqa: F401
 from obfuscators.luraph_v15 import LuraphV15
 from obfuscators.ironbrew1 import Ironbrew1
+from obfuscators.zeus import Zeus
 from obfuscators.hydra import Hydra
 from obfuscators.generic import Generic
 
 PLUGINS = [
     LuraphV15(),
     Ironbrew1(),
+    Zeus(),
     Hydra(),
     Generic(),      # fallback: behaviour trace only
 ]
