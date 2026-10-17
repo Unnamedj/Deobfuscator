@@ -291,7 +291,7 @@ hold for every change to the shared runtime:
     Path2D with invalid parent".
   - Unknown globals are proxies, except hash-like names (`_<12+ hex digits>`) and
     canaries (`CHAIN.canary`: `o.mmQ8sBTylJYLo`, random alphanumerics, 11+ long, short
-    lowercase runs, many case flips, not in the API data): nil. VMs read them to get a free
+    or vowel-less lowercase runs, many case flips, not in the API data): nil. VMs read them to get a free
     nil (loop exit); a proxy made one die with "arithmetic on number and nil".
   - `getgenv()/_G/shared` are real tables (first writes logged via a hidden `__newindex`, `getmetatable` returns nil). Writes to keys that already exist bypass `__newindex`: `CHAIN.syncGenv` diffs a shadow copy before every emitted statement (and at the end) and logs them (`_G.x = false` ... `_G.x = true`).
 - **Script-level checks** (not the obfuscator's; diaz.txt, Script42.lua): `isfunctionhooked` must

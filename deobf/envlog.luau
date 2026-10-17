@@ -4185,7 +4185,7 @@ CHAIN.canary = function(k)
 	if known ~= nil then return known end
 	local c = false
 	if #k >= 11 and not R.find(k, "[^%w]") then
-		local flips, prev, run = 0, nil, 0
+		local flips, prev, run, vowel = 0, nil, 0, false
 		c = true
 		for i = 1, #k do
 			local b = R.byte(k, i)
@@ -4193,9 +4193,12 @@ CHAIN.canary = function(k)
 			if b >= 65 and b <= 90 then up = true elseif b >= 97 and b <= 122 then up = false end
 			if up == false then
 				run += 1
-				if run > 4 then c = false break end
+				if b == 97 or b == 101 or b == 105 or b == 111 or b == 117 or b == 121 then vowel = true end
+				-- a long lowercase stretch is a word, unless it has no vowel at all
+				if run > 4 and vowel then c = false break end
 			else
 				run = 0
+				vowel = false
 			end
 			if up ~= nil then
 				if prev ~= nil and up ~= prev then flips += 1 end
