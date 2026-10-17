@@ -16,6 +16,13 @@ from obfuscators.base import Obfuscator
 HEAD = re.compile(r'\s*\(\s*"ZEUS"\s*\)\s*:\s*gsub\(')
 TAIL = re.compile(r"\(\s*newproxy\s*,\s*select\s*,\s*getfenv and getfenv\(\)\s*or _ENV\s*,\s*unpack or table\.unpack"
                   r"\s*,\s*setmetatable\s*,\s*getmetatable\s*,\s*\{\s*\.\.\.\s*\}\s*\)\s*$")
+TOP_RETURN = re.compile(r"^\s*return\s*\(\s*function\s*\(")
+# a build that adds a name/string-decoding layer in front of the VM wrapper (model.find_wrapper
+# follows it): the exact call-arg order/spelling varies, so just require this combination, rare
+# together outside this family, before paying for the heavier structural check below
+SIGNS = ("getfenv", "newproxy", "setmetatable", "getmetatable", "unpack")
+MIN_SIZE = 4000
+MIN_LEAVES = 50
 
 
 def text_strings_done(prog):
@@ -35,7 +42,15 @@ class Zeus(Obfuscator):
             return 1.0
         if tail and source.lstrip().startswith("return(function("):
             return 0.9
-        return 0.0
+        if len(source) < MIN_SIZE or not TOP_RETURN.match(source) or not all(s in source for s in SIGNS):
+            return 0.0
+        # a decoder layer in front: confirm the real thing is in there by actually locating it
+        try:
+            from obfuscators.zeus import model as M
+            m = M.Model(M.parse_source(source), source)
+        except Exception:
+            return 0.0
+        return 0.85 if len(m.leaves) >= MIN_LEAVES else 0.0
 
     def add_arguments(self, ap):
         g = ap.add_argument_group("ZEUS")

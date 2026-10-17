@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 
 import harness
 
@@ -65,6 +66,20 @@ def parse_ast(path):
     return json.loads(text[start:])["root"]
 
 
+def parse_source(text):
+    """parse_ast of in-memory text (detection: no input file exists yet)."""
+    fd, path = tempfile.mkstemp(suffix=".lua", prefix="zdetect_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("latin-1") if isinstance(text, str) else text)
+        return parse_ast(path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _loc(n):
     m = re.match(r"(\d+),(\d+) - (\d+),(\d+)", n["location"])
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
@@ -101,25 +116,93 @@ class Model:
     def __init__(self, root, source):
         self.root = root
         self.source = source
+        self.outer_requests = {}    # declaration location -> {arg tuple, ...}, filled while lifting
+        self.outer_resolved = {}    # declaration location -> {arg tuple: value}, see decoders.py
         self.find_wrapper()
+        self.collect_outer_locals()
         self.find_roles()
         self.find_dispatcher()
         self.build_leaves()
 
     # ---- wrapper: `return (function(<params>) <setup> end)(newproxy, select, env, ...)`
+    MAX_DECODER_LAYERS = 6
+
     def find_wrapper(self):
-        ret = None
-        for s in self.root["body"]:
+        """`return (function(<params>) <setup> ... end)(<args>)`. Some builds add outer layers
+        in front of it that only decode the call's own argument names/strings (a local string
+        table + a custom-base64 loop) and end in another `return (f)(...)`: follow those until
+        a function whose first statement is the setup assignment turns up. The layers passed
+        through are kept (`self.decoder_layers`): some of their locals (a decode-by-index
+        function, typically) are referenced from inside the dispatcher's leaves too."""
+        layers = []
+        stmt, call = self._last_return_call(self.root["body"])
+        for _ in range(self.MAX_DECODER_LAYERS):
+            if call is None:
+                raise ModelError("no `return (function(...) ... end)(...)` wrapper")
+            fn = call["func"]
+            while fn["type"] == "AstExprGroup":
+                fn = fn["expr"]
+            if fn["type"] != "AstExprFunction":
+                raise ModelError("wrapper is not a function")
+            body = fn["body"]["body"]
+            if body and body[0]["type"] == "AstStatAssign" and len(body[0]["vars"]) >= 8:
+                self.wrapper, self.wrapper_call, self.decoder_layers = fn, call, layers
+                return
+            nxt_stmt, nxt_call = self._last_return_call(body)   # a decoder layer: follow its own call
+            layers.append((fn, nxt_stmt))
+            stmt, call = nxt_stmt, nxt_call
+        raise ModelError("no setup assignment found through %d decoder layers" % self.MAX_DECODER_LAYERS)
+
+    @staticmethod
+    def _last_return_call(stmts):
+        for s in reversed(stmts):
             if s["type"] == "AstStatReturn" and len(s["list"]) == 1 and s["list"][0]["type"] == "AstExprCall":
-                ret = s["list"][0]
-        if ret is None:
-            raise ModelError("no `return (function(...) ... end)(...)` wrapper")
-        fn = ret["func"]
-        while fn["type"] == "AstExprGroup":
-            fn = fn["expr"]
-        if fn["type"] != "AstExprFunction":
-            raise ModelError("wrapper is not a function")
-        self.wrapper, self.wrapper_call = fn, ret
+                return s, s["list"][0]
+        return None, None
+
+    def collect_outer_locals(self):
+        """Declarations made by the decoder layers (find_wrapper), outside the wrapper's own
+        scope: the dispatcher's leaves can still reference them as Lua upvalues (a decode-by-
+        index function, typically). {declaration location: name}."""
+        self.outer_locals = {}
+
+        def declares(n, out):
+            t = n["type"]
+            if t == "AstStatLocal":
+                for v in n["vars"]:
+                    out[v["location"]] = v["name"]
+            elif t == "AstStatLocalFunction":
+                out[n["name"]["location"]] = n["name"]["name"]
+            elif t == "AstStatForIn":
+                for v in n["vars"]:
+                    out[v["location"]] = v["name"]
+            elif t == "AstStatFor":
+                out[n["var"]["location"]] = n["var"]["name"]
+
+        for fn, chain_stmt in self.decoder_layers:
+            for s in fn["body"]["body"]:
+                if s is chain_stmt:
+                    continue           # the next layer / the real wrapper: handled separately
+                walk(s, lambda n: declares(n, self.outer_locals))
+
+        self.prescan_outer_calls()
+
+    def prescan_outer_calls(self):
+        """Every call of an outer local (collect_outer_locals) anywhere in the file, with
+        constant arguments: resolved once up front (decoders.py), so the lifter does not have to
+        discover them one request at a time -- almost every one ends up needed immediately (it
+        picks a library member or feeds a comparison the dispatch itself branches on)."""
+        def visit(n):
+            if n["type"] != "AstExprCall" or n["func"]["type"] != "AstExprLocal":
+                return
+            loc = n["func"]["local"]["location"]
+            if loc not in self.outer_locals:
+                return
+            args = [const_eval(a) for a in n["args"]]
+            if any(a is None for a in args):
+                return
+            self.outer_requests.setdefault(loc, set()).add(tuple(args))
+        walk(self.root, visit)
 
     def text(self, n):
         l1, c1, l2, c2 = _loc(n)
@@ -196,9 +279,10 @@ class Model:
         f = call["func"]
         while f["type"] == "AstExprGroup":
             f = f["expr"]
-        if f["type"] != "AstExprCall" or not f["args"] or f["args"][0]["type"] != "AstExprConstantNumber":
+        ev = const_eval(f["args"][0]) if f["type"] == "AstExprCall" and f["args"] else None
+        if ev is None:
             raise ModelError("unexpected entry call %s" % self.text(call))
-        self.entry = int(f["args"][0]["value"])
+        self.entry = int(ev)
         self.entry_maker = roles.get(f["func"]["local"]["location"]) if f["func"]["type"] == "AstExprLocal" else None
 
     def name_roles(self, setup, roles):
@@ -291,15 +375,9 @@ class Model:
         for s in fn["body"]["body"]:
             if s["type"] == "AstStatLocal" and len(s["values"]) == 1 and s["values"][0]["type"] == "AstExprTable":
                 items = s["values"][0]["items"]
-                if len(items) > 8 and all(i["kind"] == "general" and i["key"]["type"] == "AstExprConstantNumber"
-                                          and i["value"]["type"] in ("AstExprConstantNumber", "AstExprUnary")
-                                          for i in items):
-                    t = {}
-                    for i in items:
-                        v = i["value"]
-                        if v["type"] == "AstExprUnary":
-                            v = {"value": -v["expr"]["value"]}
-                        t[int(i["key"]["value"])] = _num(v["value"])
+                if len(items) > 8 and all(i["kind"] == "general" and const_eval(i["key"]) is not None
+                                          and const_eval(i["value"]) is not None for i in items):
+                    t = {int(const_eval(i["key"])): const_eval(i["value"]) for i in items}
                     self.consts = t
                     self.consts_loc = s["vars"][0]["location"]
                     self.const_regs.append(regs[self.consts_loc])
@@ -329,11 +407,12 @@ class Model:
                 n = stmts[0]
                 c = n["condition"]
                 l, r = c["left"], c["right"]
-                if l["type"] == "AstExprConstantNumber":
-                    N = int(l["value"])                     # N > state
+                lc = const_eval(l)
+                if lc is not None:
+                    N = int(lc)                             # N > state
                     tlo, thi, elo, ehi = lo, min(hi, N), max(lo, N), hi
                 else:
-                    N = int(r["value"])
+                    N = int(const_eval(r))
                     if c["op"] == "CompareLt":              # state < N
                         tlo, thi, elo, ehi = lo, min(hi, N), max(lo, N), hi
                     else:                                    # state > N
@@ -380,9 +459,9 @@ class Model:
             return False
         l, r = c["left"], c["right"]
         ls = self.state_loc
-        if l["type"] == "AstExprConstantNumber" and r["type"] == "AstExprLocal":
+        if const_eval(l) is not None and r["type"] == "AstExprLocal":
             return r["local"]["location"] == ls and c["op"] == "CompareGt"
-        if r["type"] == "AstExprConstantNumber" and l["type"] == "AstExprLocal":
+        if const_eval(r) is not None and l["type"] == "AstExprLocal":
             return l["local"]["location"] == ls
         return False
 
@@ -393,6 +472,34 @@ class Model:
 
 def _num(v):
     return int(v) if float(v).is_integer() and abs(v) < 2 ** 53 else v
+
+
+def const_eval(node):
+    """A number if `node` is a constant expression (a literal, or +, -, *, // or % of constant
+    expressions): some builds write every numeric literal this way to dodge a plain grep/scan.
+    None when it reads anything that is not a constant."""
+    t = node["type"]
+    if t == "AstExprConstantNumber":
+        return _num(node["value"])
+    if t == "AstExprGroup":
+        return const_eval(node["expr"])
+    if t == "AstExprUnary" and node["op"] == "Minus":
+        v = const_eval(node["expr"])
+        return None if v is None else -v
+    if t == "AstExprBinary" and node["op"] in ("Add", "Sub", "Mul", "FloorDiv", "Mod"):
+        a, b = const_eval(node["left"]), const_eval(node["right"])
+        if a is None or b is None:
+            return None
+        if node["op"] == "Add":
+            return _num(a + b)
+        if node["op"] == "Sub":
+            return _num(a - b)
+        if node["op"] == "Mul":
+            return _num(a * b)
+        if b == 0:
+            return None
+        return _num(a // b) if node["op"] == "FloorDiv" else _num(a % b)
+    return None
 
 
 def load(path):

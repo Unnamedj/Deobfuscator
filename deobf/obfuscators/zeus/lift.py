@@ -121,13 +121,40 @@ CELLLIST = Marker("CELLLIST")
 CONSTS = Marker("CONSTS")
 
 
+class OuterRef:
+    """A reference to a decoder-layer local the dispatcher's leaves still use as a Lua upvalue
+    (model.Model.outer_locals): calling it with constant arguments is recorded as a request
+    (model.Model.outer_requests) for decoders.resolve to answer before the next lift pass."""
+    __slots__ = ("loc",)
+
+    def __init__(self, loc):
+        self.loc = loc
+
+    def __repr__(self):
+        return "OuterRef(%s)" % self.loc
+
+
+class Pending:
+    """The result of a still-unresolved decoder-layer call (OuterRef): stored and passed around
+    like any other value, but using it concretely (an operand, an index, a call target, the next
+    state) raises Unsupported right there -- the request already made can only block what
+    actually needs it, so unrelated statements of the same leaf still get walked this round."""
+    __slots__ = ("loc", "args")
+
+    def __init__(self, loc, args):
+        self.loc, self.args = loc, args
+
+    def __repr__(self):
+        return "Pending(%s, %r)" % (self.loc, self.args)
+
+
 def is_plain(v):
     return v is None or isinstance(v, (bool, int, float, bytes))
 
 
 def is_static(v):
     """Known at compile time (what facts may hold)."""
-    return is_plain(v) or isinstance(v, (Cell, UpCell, Marker, Special, Maker, PackV))
+    return is_plain(v) or isinstance(v, (Cell, UpCell, Marker, Special, Maker, PackV, Pending))
 
 
 def same(a, b):
@@ -323,9 +350,11 @@ class LeafRun:
         if n is not None:
             return self.read_reg(n)
         r = self.m.roles.get(loc)
-        if r is None:
-            raise Unsupported("unknown wrapper local %s" % node["local"]["name"])
-        return r
+        if r is not None:
+            return r
+        if loc in self.m.outer_locals:
+            return OuterRef(loc)
+        raise Unsupported("unknown wrapper local %s" % node["local"]["name"])
 
     def expr(self, node):
         t = node["type"]
@@ -580,6 +609,15 @@ class LeafRun:
                 return self.emit_call(Global("table.unpack"), items, tail)
             raise Unsupported("call of %s" % k)
         items, tail = self.args_of(node["args"])
+        if isinstance(fn, OuterRef):
+            if tail is not None or not all(is_plain(x) for x in items):
+                raise Unsupported("call of %s with a non-constant argument" % self.m.outer_locals[fn.loc])
+            args = tuple(items)
+            resolved = self.m.outer_resolved.get(fn.loc)
+            if resolved is not None and args in resolved:
+                return Multi([resolved[args]])
+            self.m.outer_requests.setdefault(fn.loc, set()).add(args)
+            return Multi([Pending(fn.loc, args)])   # don't abort the leaf: see Pending
         if not isinstance(fn, V):
             raise Unsupported("call of %r" % (fn,))
         sm = self.w.strings
@@ -1056,22 +1094,76 @@ class _Ref:
         return self._k
 
 
+MAX_DECODER_ROUNDS = 400
+
+
+def _lift_once(model, strings_map=None):
+    prog = Program(model, strings_map)
+    lines, _ = prog.lift((model.entry, None), {})
+    return prog, "\n".join(lines)
+
+
+def _resolve_outer_batch(model):
+    """Answers model.outer_requests (decoders.py) and merges the results into
+    model.outer_resolved; clears the request batch either way. True if anything new resolved."""
+    from obfuscators.zeus import decoders
+    try:
+        found = decoders.resolve(model, debug=os.environ.get("ZEUS_DECODER_DEBUG"))
+    except Exception as e:  # noqa: BLE001 - keep what was lifted so far
+        print("[!] decoder-layer resolution failed (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
+        model.outer_requests = {}
+        return False
+    model.outer_requests = {}
+    changed = False
+    for loc, vals in found.items():
+        cur = model.outer_resolved.setdefault(loc, {})
+        for args, v in vals.items():
+            if args not in cur:
+                cur[args] = v
+                changed = True
+    return changed
+
+
 def lift_program(model, use_strings=True):
-    """(Luau text, Program). With string decryption the program is lifted twice: the first text
-    is only used to find and run the script's string decryptor (strings.py)."""
-    prog = Program(model)
-    lines, params = prog.lift((model.entry, None), {})
-    text = "\n".join(lines)
+    """(Luau text, Program).
+
+    Two kinds of values are only known once something has actually run, so the program is
+    lifted more than once:
+      * decoder-layer locals the leaves still reach as Lua upvalues (model.outer_locals, some
+        builds): resolved round by round (decoders.py), since answering one call can reveal
+        leaves that were unreachable behind it; stops once a round finds nothing new.
+      * string constants (strings.py): the decryptor call sites only make sense once the above
+        is resolved, so this runs last, on the settled text.
+    """
+    if model.outer_requests:
+        # a batch, found by scanning the file once (model.prescan_outer_calls): resolving these
+        # up front avoids discovering them one dispatch-leaf request at a time (most of them end
+        # up needed immediately: a library member, or a string the dispatch itself branches on)
+        _resolve_outer_batch(model)
+    prog, text = _lift_once(model)
+    for _ in range(MAX_DECODER_ROUNDS):
+        if not model.outer_requests:
+            break
+        if not _resolve_outer_batch(model):
+            break
+        prog, text = _lift_once(model)
     if use_strings:
         from obfuscators.zeus import strings
+        # the decryptor's own set-up can sit behind ZEUS's anti-tamper gate (an `if <self test
+        # passed> then <the rest of the script> end`): the sandboxed probe never reaches it
+        # unless that condition is forced open first (gate.py), same as the final pipeline does
+        # -- only for this scan, the real text keeps the gate until Zeus.lift removes it
         try:
-            found = strings.oracle(text)
-        except Exception as e:  # noqa: BLE001 - keep the first lift
+            from obfuscators.zeus import gate
+            scan_text, _ = gate.unwrap(text)
+        except Exception:  # noqa: BLE001 - scan the text as it is
+            scan_text = text
+        try:
+            sfound = strings.oracle(scan_text)
+        except Exception as e:  # noqa: BLE001 - keep the lift so far
             print("[!] string decryption failed (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
-            found = {}
-        if found:
-            print("[*] %d strings decrypted" % len(found), file=sys.stderr)
-            prog = Program(model, found)
-            lines, params = prog.lift((model.entry, None), {})
-            text = "\n".join(lines)
+            sfound = {}
+        if sfound:
+            print("[*] %d strings decrypted" % len(sfound), file=sys.stderr)
+            prog, text = _lift_once(model, sfound)
     return text, prog

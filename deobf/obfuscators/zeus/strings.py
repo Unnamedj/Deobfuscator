@@ -59,6 +59,14 @@ class Source:
         l1, c1, l2, c2 = span(n)
         return self.data[self.starts[l1] + c1:self.starts[l2] + c2]
 
+    def start_of(self, n):
+        l1, c1, _, _ = span(n)
+        return self.starts[l1] + c1
+
+    def end_of(self, n):
+        _, _, l2, c2 = span(n)
+        return self.starts[l2] + c2
+
 
 class Index:
     """One walk over the AST: parents, owner functions of local declarations, decryptor call sites."""
@@ -260,27 +268,72 @@ if not __ok then __print("''' + SENT.encode() + rb'''", "run", tostring(__err)) 
 '''
 
 
+def _block_children(st):
+    """A compound statement's own nested statement list(s) that keep executing in source order
+    (block/if/while/for/repeat): the setup can sit inside one of these instead of directly in
+    the function body (e.g. a top-level `if <self test passed> then <the whole script> end`).
+    An `elseif` continuation is skipped (it would need its own, trickier closing text: Luau
+    desugars it into a nested AstStatIf that shares the outer one's single source-level `end`)."""
+    t = st["type"]
+    if t == "AstStatBlock":
+        return [st["body"]]
+    if t in ("AstStatWhile", "AstStatRepeat", "AstStatFor", "AstStatForIn"):
+        return [st["body"]["body"]]
+    if t == "AstStatIf":
+        out = [st["thenbody"]["body"]]
+        e = st.get("elsebody")
+        if e is not None and e["type"] != "AstStatIf":
+            out.append(e["body"])
+        return out
+    return []
+
+
+def _closer(st, src):
+    """The source text that closes a compound statement found open at a cut point."""
+    if st["type"] == "AstStatRepeat":
+        return b"\nuntil " + src.text(st["condition"])
+    return b"\nend"
+
+
+def _writes_any(stmts, watch):
+    return any(writes_of(st) & watch for st in stmts)
+
+
+def find_cut(stmts, watch):
+    """(path, statement) of the deepest, latest-in-source statement in `stmts` (recursively,
+    through _block_children) that writes a watched location; `path`: the compound statements
+    (outermost first) still open around it, each needing its own closing text. None if nothing
+    matches anywhere."""
+    found = [None]
+
+    def visit(lst, path):
+        for st in lst:
+            if not (writes_of(st) & watch):
+                continue
+            kids = [c for c in _block_children(st) if _writes_any(c, watch)]
+            if kids:
+                for child in kids:
+                    visit(child, path + [st])
+            else:
+                found[0] = (path, st)          # later in source order: overwrites any earlier one
+    visit(stmts, [])
+    return found[0]
+
+
 def cut_after_setup(stmts, watch, tail, src):
-    """The statements of a body up to the last one that writes a watched variable, with `tail`
-    right after it. A `do ... end` block holding that statement is cut too (the script's own
+    """The source text of a body up to and including the last statement (however deeply nested
+    in an if/while/for/repeat/block) that writes a watched variable, with `tail` right after it
+    and every compound statement still open at that point properly closed (the script's own
     code after the setup, such as early returns, must not run before `tail`)."""
-    last = -1
-    for i, st in enumerate(stmts):
-        if writes_of(st) & watch:
-            last = i
-    if last < 0:
+    if not stmts:
         return None
-    parts = [src.text(st) for st in stmts[:last]]
-    st = stmts[last]
-    if st["type"] == "AstStatBlock":
-        inner = cut_after_setup(st["body"], watch, tail, src)
-        if inner is None:
-            return None
-        parts.append(b"do\n" + inner + b"\nend")
-    else:
-        parts.append(src.text(st))
-        parts.append(tail)
-    return b"\n".join(parts)
+    found = find_cut(stmts, watch)
+    if found is None:
+        return None
+    path, leaf = found
+    prefix = src.data[src.start_of(stmts[0]):src.end_of(leaf)]
+    closers = b"".join(_closer(st, src) for st in reversed(path))
+    return prefix + b"\n" + tail + closers
 
 
 def oracle(text, luau=None, debug=None):
