@@ -61,7 +61,9 @@ sit in the plugin's folder (Luraph's `options.txt`).
     the lifter back end (see Lifter back end).
 - `deobf/obfuscators/`: `__init__.py` (registry `PLUGINS`, `detect`),
   `base.py` (`Obfuscator`, `Job`), `generic.py`, one package per obfuscator.
-- `deobf/research/`: shared check scripts, fingerprint scripts, Path2D data.
+- `deobf/research/`: shared check scripts, fingerprint scripts, Path2D data,
+  `obfuscate.py` (test-sample generator: makes original+obfuscated pairs to test the
+  deobfuscator; semantics-preserving, `--check` proves it; `OBFUSCATOR.md`).
 - `deobf/bin/`: `luau.exe`, `luau-ast.exe` (downloaded if missing). `luau.exe`
   is **built by `build_luau.py`** (Luau 0.739, vector metatable left writable,
   see Environment fidelity); a downloaded stock one lacks the Vector3 members.
