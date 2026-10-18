@@ -8,9 +8,9 @@ Status: **static devirtualizer** (the script is never run; only its string
 decryptor and, in some builds, a name-decoding layer are evaluated, in a
 sandbox). Fallback: generic trace. Names are randomized per build, so every
 role is found by the shape of its code.
-Samples: two user scripts (`logic.txt` 178 KB; `script_ofuscado.lua_2.txt`
-274 KB, a build with the extra decoder layer below), both no source, neither
-in `samples/`.
+Samples: three user scripts (`logic.txt` 178 KB; `script_ofuscado.lua_2.txt`
+274 KB, a build with the extra decoder layer below; a 322 KB "v2" build, see
+"Newer build"), none with a source, none in `samples/`.
 
 Some builds add an **outer decoder layer** wrapping the whole thing: `return
 (function(...) local Q = {<shuffled, custom-base64 string pieces>} local
@@ -26,6 +26,38 @@ or the exact value as the sample's own tamper check expects) --
 needed statically (dispatch thresholds, the entry state, the constant
 table); arbitrary ones inside a leaf fold naturally during lift (it
 evaluates expressions, not just pattern-matches them).
+
+### Newer build ("v2": third sample, `Auto Accept` trade script, 322 KB, no source)
+
+Same family, nothing readable in the text (every name and string is encrypted, so detection is
+structural: `Model` with >= 50 leaves). Differences the code handles (`model.py`/`lift.py`/`decoders.py`):
+
+- Outer layer: a ~24 KB string literal decoded into `knC` (chunks), `a5C(i, j)` picks a chunk,
+  `SZC(chunk, key)` decrypts it with an LCG stream keyed on the environment (`debug.info(f, "s")`
+  of `table.concat`/`string.byte`/`string.char` must be `"[C]"`). Every string is
+  `iZC[k] or SZC(a5C(a, b), c)` (`iZC` is only a memo): `model.prescan_outer_exprs` finds each
+  outermost constant-argument decoder call, `decoders.resolve_exprs` runs them all in one luau run
+  (~0.2 s for 1100), `LeafRun.call` answers by call-node location, `is_cache_probe` skips `iZC[k] or`.
+- Wrapper takes 2 args (`{...}`, env); the setup is two assignments around a `do ... end` block that
+  fills the constant table `w4C` at start-up (a tiny bytecode loop + the same integrity check):
+  `decoders.dump_consts` runs the source up to the wrapper's final `return` and prints the table
+  (`Special("consts")`: an absent key reads nil, which is how a block ends the function).
+- Dispatcher `F(cells, gc, state, args, mask)` (order read off the maker's `return F(...)`,
+  `Model.dispatcher_params`; registers 0..4 are state, args, cells, gc, mask), loop is
+  `repeat ... until state == nil`, tests are `state + c > N` (`Model.state_offset`). Closures are
+  `maker(entry, {cells}, mask)`, always variadic; the proto key is `(entry, arity, mask)`.
+- The mask `hBC` is a data register: leaves do `hBC = K - state`, then index `TuC[hBC + c]`,
+  `args[hBC + c]`, `w4C[c] + hBC - d`: all concrete during the walk (state is concrete per
+  `(leaf, incoming state)`). Leaves can contain opaque `if hBC == K then ... end` (folded in
+  `LeafRun.statement`).
+- Cells are captured **by reference** (`lift.MaybeBox`): the script forward-declares locals and
+  assigns them after the closure was made. (The older sample's lift also gets this right now; it
+  used to lose such writes.)
+- Anti-tamper gate: line-number probes then `if ok then <script> return end` + a 3-statement trap;
+  `gate.unwrap` accepts up to 6 trailing statements.
+- Deliberately not done: `strings.oracle` (no decryptor in the lifted text) and `prelude.clean`.
+- Check: trace of the lifted output equals the trace of the original (240 lines, identical);
+  `compile_check`, `scope_check` 0, `active_locals` 76. Lifts in ~3 s (57 functions).
 
 ## How the obfuscation works
 

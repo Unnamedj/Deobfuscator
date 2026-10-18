@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 
 import harness
+from obfuscators.zeus.model import _loc
 
 SENT = "__ZEUS_OUTER__"
 TIMEOUT = 30
@@ -56,34 +57,17 @@ def _prelude(model):
     return "\n".join(parts)
 
 
-def resolve(model, luau=None, debug=None):
-    """{declaration location: {arg tuple: value}}, answering every request in
-    model.outer_requests; a request luau could not answer (it raised, or needs something only
-    the real script environment has) is left out, so the caller's lift falls back to it."""
-    if not model.outer_requests:
-        return {}
-    luau = luau or harness.find_luau()
-    order = []
-    calls = []
-    for loc, argsets in model.outer_requests.items():
-        name = model.outer_locals.get(loc)
-        if not name:
-            continue
-        for args in sorted(argsets):
-            idx = len(order)
-            order.append((loc, args))
-            arglist = ", ".join(_luaval(a) for a in args)
-            calls.append(
-                "do local __ok, __r = pcall(%s, %s) local __k, __v = 'nil', '' "
-                "if __ok then "
-                "if type(__r) == 'string' then __k, __v = 's', __hex(__r) "
-                "elseif type(__r) == 'number' then __k, __v = 'n', tostring(__r) "
-                "elseif type(__r) == 'boolean' then __k, __v = 'b', (__r and '1' or '0') end end "
-                "print('%s', %d, __ok and 1 or 0, __k, __v) end"
-                % (name, arglist, SENT, idx))
-    if not calls:
-        return {}
-    code = HEAD + _prelude(model) + "\n" + "\n".join(calls) + "\n"
+def _probe(expr, idx):
+    return ("do local __ok, __r = pcall(function() return %s end) local __k, __v = 'nil', '' "
+            "if __ok then "
+            "if type(__r) == 'string' then __k, __v = 's', __hex(__r) "
+            "elseif type(__r) == 'number' then __k, __v = 'n', string.format('%%.17g', __r) "
+            "elseif type(__r) == 'boolean' then __k, __v = 'b', (__r and '1' or '0') end end "
+            "print('%s', %d, __ok and 1 or 0, __k, __v) end" % (expr, SENT, idx))
+
+
+def _run(code, luau, debug=None):
+    """Runs `code` (HEAD + prelude + probes) under luau: {probe index: value}."""
     if debug:
         with open(debug, "w", encoding="latin-1", newline="\n") as f:
             f.write(code)
@@ -123,8 +107,84 @@ def resolve(model, luau=None, debug=None):
             values[idx] = val == "1"
         elif kind == "nil":
             values[idx] = None
+    return values
+
+
+def resolve(model, luau=None, debug=None):
+    """{declaration location: {arg tuple: value}}, answering every request in
+    model.outer_requests; a request luau could not answer (it raised, or needs something only
+    the real script environment has) is left out, so the caller's lift falls back to it."""
+    if not model.outer_requests:
+        return {}
+    luau = luau or harness.find_luau()
+    order = []
+    calls = []
+    for loc, argsets in model.outer_requests.items():
+        name = model.outer_locals.get(loc)
+        if not name:
+            continue
+        for args in sorted(argsets):
+            idx = len(order)
+            order.append((loc, args))
+            calls.append(_probe("%s(%s)" % (name, ", ".join(_luaval(a) for a in args)), idx))
+    if not calls:
+        return {}
+    values = _run(HEAD + _prelude(model) + "\n" + "\n".join(calls) + "\n", luau, debug)
     out_map = {}
     for idx, (loc, args) in enumerate(order):
         if idx in values:
             out_map.setdefault(loc, {})[args] = values[idx]
     return out_map
+
+
+def resolve_exprs(model, luau=None, debug=None):
+    """{call node location: value} for model.expr_requests (source text of calls into the decoder
+    layers whose arguments are all constants, nested decoder calls included)."""
+    todo = [(k, t) for k, t in model.expr_requests.items() if k not in model.expr_resolved]
+    if not todo:
+        return {}
+    luau = luau or harness.find_luau()
+    calls = [_probe(t, i) for i, (_, t) in enumerate(todo)]
+    values = _run(HEAD + _prelude(model) + "\n" + "\n".join(calls) + "\n", luau, debug)
+    return {todo[i][0]: v for i, v in values.items()}
+
+
+def dump_consts(model, luau=None, debug=None):
+    """The newer build's constant table, filled by the wrapper's own set-up code: run the script up to
+    the wrapper's final `return` and read the table back. {key: number}."""
+    luau = luau or harness.find_luau()
+    ret = model.wrapper["body"]["body"][-1]
+    l1, c1, _, _ = _loc(ret)
+    model.text(ret)                               # (builds the line offset table)
+    off = model._starts[l1] + c1
+    probe = ("do local __t = {} for k, v in pairs(%s) do if type(k) == 'number' and type(v) == 'number' then "
+             "print('%s', k, 1, 'n', string.format('%%.17g', v)) end end "
+             "print('%s', 'done', 1, 'n', '0') error('__ZEUS_STOP__') end " % (model.consts_name, SENT, SENT))
+    code = model.source[:off] + probe + model.source[off:]
+    if debug:
+        with open(debug, "w", encoding="latin-1", newline="\n") as f:
+            f.write(code)
+    fd, path = tempfile.mkstemp(suffix=".luau", prefix="zconsts_")
+    try:
+        with os.fdopen(fd, "w", encoding="latin-1", newline="\n") as f:
+            f.write(code)
+        try:
+            out = subprocess.run([luau, path], capture_output=True, timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    consts, done = {}, False
+    for line in out.stdout.decode("latin-1").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5 or parts[0] != SENT:
+            continue
+        if parts[1] == "done":
+            done = True
+            continue
+        v = float(parts[4])
+        consts[int(float(parts[1]))] = int(v) if v.is_integer() else v
+    return consts if done else None

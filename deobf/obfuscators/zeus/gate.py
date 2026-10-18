@@ -40,7 +40,7 @@ def unwrap(text):
     if gate is None:
         return text, False
     after = body[gate + 1:]
-    if any(s["type"] not in ("AstStatLocalFunction", "AstStatReturn", "AstStatLocal") for s in after) or len(after) > 3:
+    if any(s["type"] not in ("AstStatLocalFunction", "AstStatReturn", "AstStatLocal") for s in after) or len(after) > 6:
         return text, False
     inner = list(body[gate]["thenbody"]["body"])
     # `if _x ~= "ZEUS" then return end`

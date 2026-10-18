@@ -22,6 +22,7 @@ TOP_RETURN = re.compile(r"^\s*return\s*\(\s*function\s*\(")
 # together outside this family, before paying for the heavier structural check below
 SIGNS = ("getfenv", "newproxy", "setmetatable", "getmetatable", "unpack")
 MIN_SIZE = 4000
+MIN_SIZE_ENCRYPTED = 100000
 MIN_LEAVES = 50
 
 
@@ -42,7 +43,12 @@ class Zeus(Obfuscator):
             return 1.0
         if tail and source.lstrip().startswith("return(function("):
             return 0.9
-        if len(source) < MIN_SIZE or not TOP_RETURN.match(source) or not all(s in source for s in SIGNS):
+        if len(source) < MIN_SIZE or not TOP_RETURN.match(source):
+            return 0.0
+        # (the newer build keeps every name encrypted, so the runtime names are not in the text:
+        # there only `getfenv`, the dispatcher's `repeat ... until` and its size remain visible)
+        if not all(s in source for s in SIGNS) and not ("getfenv" in source and "until" in source
+                                                        and len(source) >= MIN_SIZE_ENCRYPTED):
             return 0.0
         # a decoder layer in front: confirm the real thing is in there by actually locating it
         try:

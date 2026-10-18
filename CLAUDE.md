@@ -376,6 +376,7 @@ hold for every change to the shared runtime:
   a plain jump). Never make it a `for`: the structurer copied a latch-less
   loop ~100k times (27 MB); left alone, the header reads the VM's hidden
   loop slots (`M_1 <= 0`, undefined names).
+- A front end whose closures capture cells (ZEUS) gives `ClosureExpr` upvalues a class named `MaybeBox` (by reference, `ref_captures`); `SymList.plain = True` writes a pack as `{a, f()}`, not `table.pack`.
 - Luau's 200-active-locals limit: `variables.limit_locals` -> `fit_locals`:
   small closed `do ... end` segments (`wrap_segments`) when their estimate
   (`dry=True`) fits, else `split_block` (one closed prefix, e.g. a loader and

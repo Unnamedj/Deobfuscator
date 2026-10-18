@@ -104,6 +104,20 @@ class UpCell:
         return "UpCell(%d)" % self.idx
 
 
+class MaybeBox:
+    """A closure's capture of a cell register: by reference, like a Luau upvalue. The back end
+    looks the class up by name (codegen.ref_captures, variables.closure_ref_regs), so a write
+    to the variable after the closure was made (`local f; g = function() f() end; f = ...`)
+    is kept."""
+    __slots__ = ("reg",)
+
+    def __init__(self, reg):
+        self.reg = reg
+
+    def __repr__(self):
+        return "r%d" % self.reg
+
+
 class Marker:
     """A compile-time singleton (the argument array, the cell list, the constant table)."""
     __slots__ = ("name",)
@@ -404,6 +418,12 @@ class LeafRun:
             if not isinstance(k, (int, float)) or int(k) not in self.m.consts:
                 raise Unsupported("constant table index %r" % (k,))
             return self.m.consts[int(k)]
+        if isinstance(b, Special) and b.kind == "consts":
+            # the newer build's table, filled by the wrapper at start-up (decoders.dump_consts):
+            # a key it lacks reads nil, which is how a block ends the function
+            if not isinstance(k, (int, float)) or isinstance(k, bool):
+                raise Unsupported("constant table index %r" % (k,))
+            return self.m.consts.get(int(k))
         if b is CELLLIST:
             if not isinstance(k, (int, float)):
                 raise Unsupported("cell list index %r" % (k,))
@@ -466,6 +486,8 @@ class LeafRun:
 
     def binary(self, node):
         op = node["op"]
+        if op == "Or" and self.is_cache_probe(node["left"]):
+            return self.expr(node["right"])
         if op in ("And", "Or"):
             a = self.expr(node["left"])
             if not isinstance(a, V):
@@ -478,6 +500,12 @@ class LeafRun:
                 raise Unsupported("call inside a short-circuit expression")
             return V(Bin(op, a.e, self.E(b)), Bin(op, a.t, self.T(b)))
         return self.binop(op, self.expr(node["left"]), self.expr(node["right"]))
+
+    def is_cache_probe(self, n):
+        """`iZC[k] or SZC(...)`: the memo lookup in front of a decoder call; the call is the value."""
+        return n["type"] == "AstExprIndexExpr" and n["expr"]["type"] == "AstExprLocal" \
+            and n["expr"]["local"]["location"] in self.m.outer_locals \
+            and n["expr"]["local"]["location"] not in self.m.roles
 
     def binop(self, op, a, b):
         if is_plain(a) and is_plain(b):
@@ -547,6 +575,7 @@ class LeafRun:
             # `{a, f()}`: a packed list; the back end drops it when only the call's results are read
             te = S.SymList([e for _, e in items], tail)
             tt = S.SymList([e for _, e in trees], tail)
+            te.plain = tt.plain = True      # (a constructor: codegen must not write it as table.pack)
         elif tail is not None:
             te = CG.NewTableE(items, tail)
             tt = CG.NewTableE(trees, tail)
@@ -569,6 +598,9 @@ class LeafRun:
         return items, tail
 
     def call(self, node):
+        hit = self.m.expr_resolved.get(node["location"], Ellipsis)
+        if hit is not Ellipsis:
+            return Multi([hit])         # a decoder-layer call with constant arguments (decoders.resolve_exprs)
         fn = self.expr(node["func"])
         if isinstance(fn, Maker):
             return Multi([self.make_closure(fn, node["args"])])
@@ -657,25 +689,40 @@ class LeafRun:
         return Multi([], TempTail(tid, 1))
 
     def make_closure(self, mk, args):
-        if len(args) != 2 or args[1]["type"] != "AstExprTable":
+        if len(args) not in (2, 3) or args[1]["type"] != "AstExprTable":
             raise Unsupported("closure constructor arguments")
         entry = self.expr(args[0])
         if not isinstance(entry, int):
             raise Unsupported("closure entry %r" % (entry,))
+        mask = None
+        if len(args) == 3:
+            mask = self.expr(args[2])
+            if not isinstance(mask, int) or isinstance(mask, bool):
+                raise Unsupported("closure mask %r" % (mask,))
         ups = []
         for it in args[1]["items"]:
             c = self.expr(it["value"])
             if isinstance(c, Cell):
-                ups.append(Reg(self.w.cell_reg(c.site)))
+                ups.append(MaybeBox(self.w.cell_reg(c.site)))
             elif isinstance(c, UpCell):
                 ups.append(Upval(c.idx))
             else:
                 raise Unsupported("closure capture %r" % (c,))
-        e = ClosureExpr((entry, mk.arity), ups)
+        e = ClosureExpr((entry, mk.arity, mask) if mask is not None else (entry, mk.arity), ups)
         return V(e, e)
 
     # ---- statements
     def statement(self, st):
+        if st["type"] == "AstStatIf":
+            # an opaque predicate: the condition folds once the registers it reads are known
+            c = self.expr(st["condition"])
+            if not is_plain(c):
+                raise Unsupported("condition %r in a block" % (c,))
+            body = st["thenbody"] if truthy(c) else st.get("elsebody")
+            if body is not None:
+                for x in ([body] if body["type"] == "AstStatIf" else body["body"]):
+                    self.statement(x)
+            return
         if st["type"] != "AstStatAssign":
             raise Unsupported("statement %s" % st["type"])
         targets = st["vars"]
@@ -707,7 +754,14 @@ class LeafRun:
             lvs.append(self.lvalue(tg))
         if n > 1:
             vals = self.protect(lvs, vals)
-        for lv, v in zip(lvs, vals):
+        pairs = list(zip(lvs, vals))
+        if n > 1 and all(lv[0] == "reg" for lv in lvs) and len({lv[1] for lv in lvs}) == n \
+                and all(isinstance(v, V) and isinstance(v.e, TempVal) for v in vals) \
+                and len({v.e.t for v in vals}) == 1:
+            # `a, b = r[2], r[1]` out of one call's results: write them in result order, so the
+            # back end can fold the call into `local a, b = f()`
+            pairs.sort(key=lambda p: p[1].e.i)
+        for lv, v in pairs:
             self.store(lv, v)
 
     def lvalue(self, tg):
@@ -899,10 +953,11 @@ class _Ctor(V):
 class Walk:
     """Constant propagation over the leaves of one function."""
 
-    def __init__(self, model, entry, arity, strings=None):
+    def __init__(self, model, entry, arity, strings=None, mask=None):
         self.m = model
         self.entry = entry
         self.arity = arity
+        self.mask = mask
         self.strings = strings          # {key: (mode, plaintext)} from strings.oracle
         self.drop_calls = set()         # calls whose result a decrypted string replaced
         self.cells = {}
@@ -919,6 +974,8 @@ class Walk:
         facts[2] = CELLLIST
         for n in self.m.const_regs:
             facts[n] = CONSTS
+        if self.m.mask_reg is not None:
+            facts[self.m.mask_reg] = self.mask
         for n in self.m.table_regs:
             facts.pop(n)            # a fresh table (made in the prologue)
         if self.m.spill_reg is not None:
@@ -1026,11 +1083,12 @@ class Program:
         self.memo = {}
 
     def lift(self, proto, upnames, depth=0):
-        entry, arity = proto
+        entry, arity = proto[:2]
+        mask = proto[2] if len(proto) > 2 else None
         self.stats["functions"] += 1
         self.lifting.add(proto)
         try:
-            wk = Walk(self.m, entry, arity, self.strings)
+            wk = Walk(self.m, entry, arity, self.strings, mask)
             k0, order = wk.run()
             if os.environ.get("ZEUS_RAW"):
                 with open(os.path.join(os.environ["ZEUS_RAW"], "fn_%d.txt" % entry), "w") as f:
@@ -1064,7 +1122,9 @@ class Program:
         capnames = getattr(c, "capnames", {})
         upnames = {}
         for i, e in enumerate(c.upvals, 1):
-            if isinstance(e, Reg):
+            if isinstance(e, MaybeBox):
+                upnames[i] = capnames.get(e.reg, "nil")
+            elif isinstance(e, Reg):
                 upnames[i] = capnames.get(e.n, "nil")
             elif isinstance(e, Upval):
                 upnames[i] = parent_names.get(("up", e.idx), "upv%d" % e.idx)
@@ -1099,7 +1159,8 @@ MAX_DECODER_ROUNDS = 400
 
 def _lift_once(model, strings_map=None):
     prog = Program(model, strings_map)
-    lines, _ = prog.lift((model.entry, None), {})
+    lines, _ = prog.lift((model.entry, None, model.entry_mask) if model.entry_mask is not None
+                         else (model.entry, None), {})
     return prog, "\n".join(lines)
 
 
@@ -1135,6 +1196,19 @@ def lift_program(model, use_strings=True):
       * string constants (strings.py): the decryptor call sites only make sense once the above
         is resolved, so this runs last, on the settled text.
     """
+    if model.consts_table is not None and not model.consts:
+        from obfuscators.zeus import decoders
+        c = decoders.dump_consts(model, debug=os.environ.get("ZEUS_CONSTS_DEBUG"))
+        if not c:
+            raise Unsupported("could not compute the constant table")
+        model.consts = c
+        print("[*] %d constants computed by the script's own set-up code" % len(c), file=sys.stderr)
+        use_strings = False
+    if model.expr_requests:
+        from obfuscators.zeus import decoders
+        got = decoders.resolve_exprs(model, debug=os.environ.get("ZEUS_DECODER_DEBUG"))
+        model.expr_resolved.update(got)
+        print("[*] %d/%d decoder-layer strings resolved" % (len(got), len(model.expr_requests)), file=sys.stderr)
     if model.outer_requests:
         # a batch, found by scanning the file once (model.prescan_outer_calls): resolving these
         # up front avoids discovering them one dispatch-leaf request at a time (most of them end

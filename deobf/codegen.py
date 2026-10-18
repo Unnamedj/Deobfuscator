@@ -271,7 +271,11 @@ def convert_stmts(stmts, D):
             if isinstance(v, SymList):
                 # a packed multret list kept in a register: the consumer
                 # already refers to its contents; keep a readable fallback
-                v = CallE(Global("table.pack"), Multi([conv(x, D) for x in v.items], conv_tail(v.tail)))
+                if getattr(v, "plain", False):
+                    # a plain constructor `{a, f()}` (no `n` field), not table.pack
+                    v = NewTableE([(None, conv(x, D)) for x in v.items], conv_tail(v.tail))
+                else:
+                    v = CallE(Global("table.pack"), Multi([conv(x, D) for x in v.items], conv_tail(v.tail)))
                 a = AssignS([conv(st.target, D)], Multi([v]))
                 a.pack = True
                 out.append(a)
@@ -448,6 +452,21 @@ def simplify_block(b, live_out, temp_uses_total, open_in=frozenset()):
                     st[j].values.items[0].i == len(targets) + 1:
                 targets.append(st[j].targets[0])
                 j += 1
+            if not (targets and len(targets) == n_uses):
+                # the same, written in another order (`a = T[2]; b = T[1]`): plain distinct
+                # registers take the values, so the order of the moves does not matter
+                got = {}
+                j2 = i + 1
+                while j2 < len(st) and isinstance(st[j2], AssignS) and len(st[j2].targets) == 1 and \
+                        len(st[j2].values.items) == 1 and st[j2].values.tail is None and \
+                        isinstance(st[j2].values.items[0], TempVal) and st[j2].values.items[0].t == s.t and \
+                        st[j2].values.items[0].i not in got and isinstance(st[j2].targets[0], Reg):
+                    got[st[j2].values.items[0].i] = st[j2].targets[0]
+                    j2 += 1
+                if len(got) == n_uses and sorted(got) == list(range(1, len(got) + 1)) \
+                        and len({t.n for t in got.values()}) == len(got):
+                    targets = [got[k] for k in sorted(got)]
+                    j = j2
             if targets and len(targets) == n_uses:
                 # one target takes the first value: a plain expression (inlinable)
                 out.append(AssignS(targets, Multi([s.call]) if len(targets) == 1

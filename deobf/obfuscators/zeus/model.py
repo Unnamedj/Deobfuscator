@@ -116,6 +116,8 @@ class Model:
     def __init__(self, root, source):
         self.root = root
         self.source = source
+        self.expr_requests = {}     # call node location -> source text (decoder calls with constant args)
+        self.expr_resolved = {}     # call node location -> value, see decoders.resolve_exprs
         self.outer_requests = {}    # declaration location -> {arg tuple, ...}, filled while lifting
         self.outer_resolved = {}    # declaration location -> {arg tuple: value}, see decoders.py
         self.find_wrapper()
@@ -186,6 +188,51 @@ class Model:
                 walk(s, lambda n: declares(n, self.outer_locals))
 
         self.prescan_outer_calls()
+        self.prescan_outer_exprs()
+
+    ARITH = ("Add", "Sub", "Mul", "Div", "FloorDiv", "Mod", "Pow", "Concat")
+
+    def prescan_outer_exprs(self):
+        """The newer build writes every string as `iZC[k] or SZC(a5C(a, b), c)`: nested calls of
+        decoder-layer locals whose arguments are all constants. Each such call, outermost first, is
+        one request (its source text) answered by running the layers (decoders.resolve_exprs)."""
+        covered = set()
+        found = []
+
+        def const_expr(n):
+            t = n["type"]
+            if t in ("AstExprConstantNumber", "AstExprConstantString", "AstExprConstantBool", "AstExprConstantNil"):
+                return True
+            if t == "AstExprGroup":
+                return const_expr(n["expr"])
+            if t == "AstExprUnary":
+                return n["op"] == "Minus" and const_expr(n["expr"])
+            if t == "AstExprBinary":
+                return n["op"] in self.ARITH and const_expr(n["left"]) and const_expr(n["right"])
+            if t == "AstExprCall" and n["func"]["type"] == "AstExprLocal" \
+                    and n["func"]["local"]["location"] in self.outer_locals:
+                if all(const_expr(a) for a in n["args"]):
+                    covered.update(id(a) for a in n["args"])
+                    found.append(n)
+                    return True
+            return False
+
+        def visit(n):
+            if n["type"] == "AstExprCall":
+                const_expr(n)
+        walk(self.root, visit)
+        # a call nested in another request's arguments is not a request of its own
+        inner = set()
+
+        def mark(n):
+            if n["type"] == "AstExprCall":
+                for a in n["args"]:
+                    walk(a, lambda x: inner.add(id(x)))
+        for n in found:
+            mark(n)
+        for n in found:
+            if id(n) not in inner:
+                self.expr_requests[n["location"]] = self.text(n)
 
     def prescan_outer_calls(self):
         """Every call of an outer local (collect_outer_locals) anywhere in the file, with
@@ -239,6 +286,10 @@ class Model:
             if kind:
                 roles[params[i]["location"]] = Special(kind)
         # the setup assignment: `V, J, p, ... = function() ... end, function(o, t) ... end, {}, 0, ...`
+        # (the newer build splits it in two, around a `do ... end` block that fills the constant table)
+        setups = [s for s in w["body"]["body"]
+                  if s["type"] == "AstStatAssign" and len(s["vars"]) >= 3
+                  and all(v["type"] == "AstExprLocal" for v in s["vars"])]
         setup = None
         for s in w["body"]["body"]:
             if s["type"] == "AstStatAssign" and len(s["vars"]) >= 8:
@@ -249,29 +300,29 @@ class Model:
         locs = {a["name"]: a["location"] for a in w["args"]}
         self.wrapper_locals = locs
         disp_loc = None
-        for v, val in zip(setup["vars"], setup["values"]):
-            loc = v["local"]["location"]
-            if val["type"] == "AstExprFunction":
-                kind = self.classify_function(val)
-                if kind == "dispatcher":
-                    disp_loc = loc
-                    self.dispatcher_fn = val
-                    roles[loc] = Special("dispatcher")
-                elif isinstance(kind, Maker):
-                    roles[loc] = kind
-                elif kind:
-                    roles[loc] = Special(kind)
-            elif val["type"] == "AstExprTable" and not val["items"]:
-                roles.setdefault(loc, Special("table"))
+        for st in setups:
+            for v, val in zip(st["vars"], st["values"]):
+                loc = v["local"]["location"]
+                if val["type"] == "AstExprFunction":
+                    kind = self.classify_function(val)
+                    if kind == "dispatcher":
+                        disp_loc = loc
+                        self.dispatcher_fn = val
+                        roles[loc] = Special("dispatcher")
+                    elif isinstance(kind, Maker):
+                        roles[loc] = kind
+                        self.maker_fn = val
+                    elif kind:
+                        roles[loc] = Special(kind)
+                elif val["type"] == "AstExprTable" and not val["items"]:
+                    roles.setdefault(loc, Special("table"))
         if disp_loc is None:
             raise ModelError("no dispatcher function in the wrapper")
-        self.name_roles(setup, roles)
-        # the cell store `w` is the table the alloc function's sibling reads: the one cells are read from
+        self.setups = setups
+        self.name_roles(setups, roles)
         self.disp_loc = disp_loc
         self.roles = roles
-        # entry: `return (maker(<state>, {}))(unpack(<script args>))`
-        callee = self.wrapper_call["func"]
-        # (the wrapper call's own callee is the function; the entry is in the wrapper's return)
+        # entry: `return (maker(<state>, {}[, <mask>]))(unpack(<script args>))`
         ret = [s for s in w["body"]["body"] if s["type"] == "AstStatReturn"]
         if not ret:
             raise ModelError("no entry call in the wrapper")
@@ -283,24 +334,60 @@ class Model:
         if ev is None:
             raise ModelError("unexpected entry call %s" % self.text(call))
         self.entry = int(ev)
+        self.entry_mask = None
+        if len(f["args"]) >= 3:
+            mv = const_eval(f["args"][2])
+            self.entry_mask = None if mv is None else int(mv)
         self.entry_maker = roles.get(f["func"]["local"]["location"]) if f["func"]["type"] == "AstExprLocal" else None
+        # the newer build unpacks the script arguments through a looked-up `unpack`
+        if call["args"] and call["args"][0]["type"] == "AstExprCall" \
+                and call["args"][0]["func"]["type"] == "AstExprLocal":
+            loc = call["args"][0]["func"]["local"]["location"]
+            if loc not in roles:
+                roles[loc] = Special("unpack")
 
-    def name_roles(self, setup, roles):
-        """Of the wrapper's two empty tables, the refcount table is the one the alloc function
-        writes (`k[n] = 1`); the other holds the cells' values."""
+    def name_roles(self, setups, roles):
+        """Of the wrapper's empty tables, the refcount table is the one the alloc function
+        writes (`k[n] = 1`); the other holds the cells' values. The newer build has a third, the
+        constant table: filled by the wrapper's own set-up code and only read by the dispatcher."""
         tables = [loc for loc, r in roles.items() if isinstance(r, Special) and r.kind == "table"]
         refc = None
-        for v, val in zip(setup["vars"], setup["values"]):
-            if roles.get(v["local"]["location"]) == "alloc" or (
-                    isinstance(roles.get(v["local"]["location"]), Special)
-                    and roles[v["local"]["location"]].kind == "alloc"):
-                for s in val["body"]["body"]:
-                    if s["type"] == "AstStatAssign" and s["vars"][0]["type"] == "AstExprIndexExpr":
-                        e = s["vars"][0]["expr"]
-                        if e["type"] == "AstExprLocal":
-                            refc = e["local"]["location"]
+        for setup in setups:
+            for v, val in zip(setup["vars"], setup["values"]):
+                r = roles.get(v["local"]["location"])
+                if isinstance(r, Special) and r.kind == "alloc":
+                    for s in val["body"]["body"]:
+                        if s["type"] == "AstStatAssign" and s["vars"][0]["type"] == "AstExprIndexExpr":
+                            e = s["vars"][0]["expr"]
+                            if e["type"] == "AstExprLocal":
+                                refc = e["local"]["location"]
+        written = set()
+
+        def writes(x):
+            if x["type"] == "AstStatAssign":
+                for t in x["vars"]:
+                    if t["type"] == "AstExprIndexExpr" and t["expr"]["type"] == "AstExprLocal":
+                        written.add(t["expr"]["local"]["location"])
+        walk(self.dispatcher_fn["body"], writes)
+        self.consts_table = None
+        self.consts_name = None
         for loc in tables:
-            roles[loc] = Special("refcount" if loc == refc else "cells")
+            if loc == refc:
+                roles[loc] = Special("refcount")
+            elif self.dispatcher_loop_kind() == "repeat" and loc not in written:
+                roles[loc] = Special("consts")
+                self.consts_table = loc
+                self.consts_name = [a["name"] for a in self.wrapper["args"] if a["location"] == loc][0]
+            else:
+                roles[loc] = Special("cells")
+
+    def dispatcher_loop_kind(self):
+        for s in self.dispatcher_fn["body"]["body"]:
+            if s["type"] == "AstStatRepeat":
+                return "repeat"
+            if s["type"] == "AstStatWhile":
+                return "while"
+        return None
 
     def classify_function(self, fn):
         """What a function of the wrapper's setup assignment is, from its shape."""
@@ -309,23 +396,23 @@ class Model:
         found = {"while": False, "for": False, "inner": None}
 
         def look(x):
-            if x["type"] == "AstStatWhile":
+            if x["type"] in ("AstStatWhile", "AstStatRepeat"):
                 found["while"] = True
             if x["type"] == "AstStatFor":
                 found["for"] = True
         walk(fn["body"], look)
-        if len(params) == 4 and found["while"]:
+        if len(params) in (4, 5) and found["while"]:
             n_ifs = [0]
             walk(fn["body"], lambda x: n_ifs.__setitem__(0, n_ifs[0] + 1) if x["type"] == "AstStatIf" else None)
             if n_ifs[0] > 20:
                 return "dispatcher"
-        if len(params) == 2:
+        if len(params) in (2, 3):
             # maker: local q = h(t); local N = function(<params>) return F(o, {<params>}, t, q) end; return N
             inner = [x for x in functions_in(fn["body"])]
             if len(inner) == 1:
                 f = inner[0]
                 return Maker(None if f.get("vararg") else len(f["args"]))
-        if len(params) == 0 and len(body) == 3 and body[-1]["type"] == "AstStatReturn":
+        if len(params) == 0 and 3 <= len(body) <= 4 and body[-1]["type"] == "AstStatReturn":
             return "alloc"
         if len(params) == 1:
             if found["while"]:
@@ -336,36 +423,74 @@ class Model:
         return None
 
     # ---- the dispatcher
+    PARAM_ORDER = ("state", "args", "cells", "gc", "mask")
+
+    def dispatcher_params(self):
+        """{role: parameter position} of the dispatcher `F`. The older build always has
+        `F(state, args, cells, gc)`; the newer one shuffles them, so they are read off the
+        maker's `return F(...)` call: the maker's own parameters are (entry, cells, mask), `{...}`
+        is the argument array and a local the maker made is the gc handle."""
+        fn = self.dispatcher_fn
+        if self.dispatcher_loop_kind() != "repeat":
+            return {r: i for i, r in enumerate(self.PARAM_ORDER[:len(fn["args"])])}
+        mk = getattr(self, "maker_fn", None)
+        if mk is None:
+            raise ModelError("no closure maker")
+        mp = {a["location"]: i for i, a in enumerate(mk["args"])}
+        calls = []
+        walk(mk["body"], lambda x: calls.append(x) if x["type"] == "AstExprCall"
+             and x["func"]["type"] == "AstExprLocal" and x["func"]["local"]["location"] == self.disp_loc else None)
+        if len(calls) != 1 or len(calls[0]["args"]) != len(fn["args"]):
+            raise ModelError("the maker does not call the dispatcher in the expected way")
+        out = {}
+        for i, a in enumerate(calls[0]["args"]):
+            if a["type"] == "AstExprTable" and len(a["items"]) == 1 and a["items"][0]["value"]["type"] == "AstExprVarargs":
+                out["args"] = i
+            elif a["type"] == "AstExprLocal":
+                k = mp.get(a["local"]["location"])
+                out[{0: "state", 1: "cells", 2: "mask", None: "gc"}[k]] = i
+            else:
+                raise ModelError("unexpected maker call argument")
+        if set(out) != {"state", "args", "cells", "gc", "mask"}:
+            raise ModelError("dispatcher parameters not recognised: %s" % sorted(out))
+        return out
+
     def find_dispatcher(self):
         fn = self.dispatcher_fn
         self.dispatcher = fn
         self.params = [a["location"] for a in fn["args"]]
+        self.param_pos = self.dispatcher_params()
         regs = {}
         names = []
-        for a in fn["args"]:
-            regs[a["location"]] = len(regs)
-            names.append(a["name"])
+        # registers 0..n: state, args, cells, gc[, mask] (lift.py relies on this), then the locals
+        for role in self.PARAM_ORDER:
+            if role in self.param_pos:
+                a = fn["args"][self.param_pos[role]]
+                regs[a["location"]] = len(regs)
+                names.append(a["name"])
+        self.mask_reg = regs[fn["args"][self.param_pos["mask"]]["location"]] if "mask" in self.param_pos else None
         loop = None
         for s in fn["body"]["body"]:
             if s["type"] == "AstStatLocal":
                 for v in s["vars"]:
                     regs[v["location"]] = len(regs)
                     names.append(v["name"])
-            elif s["type"] == "AstStatWhile":
+            elif s["type"] in ("AstStatWhile", "AstStatRepeat"):
                 loop = s
-        if loop is None:
-            raise ModelError("dispatcher without a loop")
         self.regs, self.reg_names, self.loop = regs, names, loop
         # after the loop: `return unpack(<return array>)`
         self.ret_reg = None
-        for s in fn["body"]["body"]:
-            if s["type"] == "AstStatReturn" and len(s["list"]) == 1 and s["list"][0]["type"] == "AstExprCall":
+        rets = []
+        walk(fn["body"], lambda x: rets.append(x) if x["type"] == "AstStatReturn" else None)
+        for s in rets:
+            if len(s["list"]) == 1 and s["list"][0]["type"] == "AstExprCall":
                 a = s["list"][0]["args"]
-                if len(a) == 1 and a[0]["type"] == "AstExprLocal":
+                if len(a) >= 1 and a[0]["type"] == "AstExprLocal" and \
+                        all(const_eval(x) == 1 for x in a[1:]):
                     self.ret_reg = regs.get(a[0]["local"]["location"])
         if self.ret_reg is None:
             raise ModelError("dispatcher does not return an array register")
-        self.state_loc = fn["args"][0]["location"]
+        self.state_loc = fn["args"][self.param_pos["state"]]["location"]
         # prologue locals with a table value: the constant table (`local k = {[n] = number, ...}`)
         # and plain `{}` tables (fresh per call)
         self.consts = {}
@@ -407,15 +532,16 @@ class Model:
                 n = stmts[0]
                 c = n["condition"]
                 l, r = c["left"], c["right"]
-                lc = const_eval(l)
-                if lc is not None:
-                    N = int(lc)                             # N > state
+                dl = self.state_offset(l)
+                if dl is None:
+                    # N > state + d   ==   state < N - d
+                    N = int(const_eval(l)) - self.state_offset(r)
                     tlo, thi, elo, ehi = lo, min(hi, N), max(lo, N), hi
                 else:
-                    N = int(const_eval(r))
-                    if c["op"] == "CompareLt":              # state < N
+                    N = int(const_eval(r)) - dl
+                    if c["op"] == "CompareLt":              # state + d < N'
                         tlo, thi, elo, ehi = lo, min(hi, N), max(lo, N), hi
-                    else:                                    # state > N
+                    else:                                    # state + d > N'
                         tlo, thi, elo, ehi = max(lo, N + 1), hi, lo, min(hi, N + 1)
                 descend(n["thenbody"], tlo, thi)
                 if n.get("elsebody"):
@@ -453,16 +579,36 @@ class Model:
                     return True
         return False
 
+    def state_offset(self, n):
+        """d if the expression is `state + d` (also `d + state`, `state - d`, plain `state`:
+        d = 0) with d a constant; None for anything else."""
+        t = n["type"]
+        if t == "AstExprGroup":
+            return self.state_offset(n["expr"])
+        if t == "AstExprLocal":
+            return 0 if n["local"]["location"] == self.state_loc else None
+        if t == "AstExprBinary" and n["op"] in ("Add", "Sub"):
+            d = self.state_offset(n["left"])
+            if d is not None:
+                c = const_eval(n["right"])
+                if c is not None:
+                    return d + c if n["op"] == "Add" else d - c
+            elif n["op"] == "Add":
+                d = self.state_offset(n["right"])
+                c = const_eval(n["left"])
+                if d is not None and c is not None:
+                    return d + c
+        return None
+
     def is_dispatch_if(self, n):
         c = n["condition"]
         if c["type"] != "AstExprBinary" or c["op"] not in ("CompareLt", "CompareGt"):
             return False
         l, r = c["left"], c["right"]
-        ls = self.state_loc
-        if const_eval(l) is not None and r["type"] == "AstExprLocal":
-            return r["local"]["location"] == ls and c["op"] == "CompareGt"
-        if const_eval(r) is not None and l["type"] == "AstExprLocal":
-            return l["local"]["location"] == ls
+        if const_eval(l) is not None and self.state_offset(r) is not None:
+            return c["op"] == "CompareGt"
+        if const_eval(r) is not None and self.state_offset(l) is not None:
+            return True
         return False
 
     def leaf_for(self, state):
