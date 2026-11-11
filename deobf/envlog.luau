@@ -791,8 +791,10 @@ local function runHandlers()
 		local h = HANDLERS[i]
 		i += 1
 		popTo(1)
-		local ok, err = R.pcall(runInBlock, h.rec.block, h.fn, R.unpack(h.args, 1, h.n))
-		if not ok and err == ABORT then return end
+		if not h.pumps then
+			local ok, err = R.pcall(runInBlock, h.rec.block, h.fn, R.unpack(h.args, 1, h.n))
+			if not ok and err == ABORT then return end
+		end
 	end
 end
 
@@ -1418,6 +1420,14 @@ local function onCall(p, ...)
 		local fnTok = R.type(a1) == "function" and captureFunction(a1, SIGNAL_PARAMS[sigName] or { "..." }, nil, "handler") or fmt(a1)
 		local conn = callP(calleeText .. "(" .. fnTok .. ")", "connection", "RBXScriptConnection")
 		INFO[conn].props.Connected = true
+		-- frame signals: remember the connection so --cfg frame_pump can fire the handler during task.wait
+		local lastH = HANDLERS[#HANDLERS]
+		if CFG.frame_pump and lastH and lastH.fn == a1 and (sigName == "RenderStepped" or sigName == "Heartbeat"
+			or sigName == "Stepped" or sigName == "PreRender" or sigName == "PreSimulation"
+			or sigName == "PostSimulation" or sigName == "PreAnimation") then
+			lastH.conn = conn
+			lastH.sig = sigName
+		end
 		return conn
 	end
 	if name == "Wait" and isMethod then
@@ -1500,6 +1510,18 @@ local function onCall(p, ...)
 	end
 	if self and RUNSERVICE_BOOL[name] ~= nil then
 		return RUNSERVICE_BOOL[name]
+	end
+	-- UserInputService:GetMouseLocation() / GetMouseDelta() are Vector2 values in Roblox, and scripts check
+	-- typeof(result) == "Vector2" (Voltils' environment check spins when it is not). The mouse sits mid-screen.
+	if self and (name == "GetMouseLocation" or name == "GetMouseDelta") and a1 == nil
+		and sinfo and sinfo.className == "UserInputService" then
+		local mx, my = 0, 0
+		if name == "GetMouseLocation" then mx, my = 960, 540 end
+		local p = callP(calleeText .. "()", name == "GetMouseLocation" and "mouseLocation" or "mouseDelta", "Vector2")
+		INFO[p].props.X, INFO[p].props.Y = mx, my
+		INFO[p].props.Magnitude = R.sqrt and R.sqrt(mx * mx + my * my) or math.sqrt(mx * mx + my * my)
+		attachReal(p, "Vector2", "new", true, mx, my)
+		return p
 	end
 	if sinfo and (sinfo.created or sinfo.kids) then
 		if name == "GetChildren" then
@@ -2437,9 +2459,26 @@ local function spawnLike(label, fn, ...)
 	end
 	return callP(label .. "(" .. fmtArgs(fn, ...) .. ")", "thread", "thread")
 end
+-- --cfg frame_pump=true: the engine fires RenderStepped/Heartbeat every frame, so a script that connects one,
+-- waits a moment and checks that it fired (Voltils' environment check) must see the handler run. Each
+-- connected frame handler runs once per wait; the first run is recorded as the handler's body, later ones
+-- are silent. A Disconnect()ed handler stops.
+CHAIN.pumpFrames = function()
+	for _, h in HANDLERS do
+		if h.conn and not h.done and INFO[h.conn].props.Connected ~= false then
+			h.pumps = (h.pumps or 0) + 1
+			if h.pumps > 200 then h.done = true end
+			local blk = h.pumps == 1 and h.rec.block or { lines = {}, waits = {} }
+			local args = h.sig == "Stepped" and { 1, 1 / 60 } or { 1 / 60 }
+			local ok, err = R.pcall(runInBlock, blk, h.fn, R.unpack(args))
+			if not ok and err == ABORT then R.error(ABORT, 0) end
+		end
+	end
+end
 local function doWait(label, t)
 	emit({ text = label .. "(" .. (t ~= nil and fmt(t) or "") .. ")" })
 	onWait()
+	if CFG.frame_pump and #HANDLERS > 0 then CHAIN.pumpFrames() end
 	return (R.type(t) == "number" and t) or 0.03, R.clock()
 end
 -- Errors are raised exactly like luaL_typeerror in a C function would
@@ -4185,7 +4224,9 @@ CHAIN.canary = function(k)
 	if known ~= nil then return known end
 	local c = false
 	if #k >= 11 and not R.find(k, "[^%w]") then
-		local flips, prev, run, vowel = 0, nil, 0, false
+		local flips, prev, run, vowel, word = 0, nil, 0, false, false
+		-- a real word never carries two digits: then a long lowercase stretch is no reason to keep the name
+		local _, digits = R.gsub(k, "%d", "")
 		c = true
 		for i = 1, #k do
 			local b = R.byte(k, i)
@@ -4195,7 +4236,7 @@ CHAIN.canary = function(k)
 				run += 1
 				if b == 97 or b == 101 or b == 105 or b == 111 or b == 117 or b == 121 then vowel = true end
 				-- a long lowercase stretch is a word, unless it has no vowel at all
-				if run > 4 and vowel then c = false break end
+				if run > 4 and vowel and digits < 2 then word = true end
 			else
 				run = 0
 				vowel = false
@@ -4205,7 +4246,12 @@ CHAIN.canary = function(k)
 				prev = up
 			end
 		end
-		c = c and (flips >= 6 or (flips >= 3 and R.find(k, "%d") ~= nil))
+		-- two digits mixed into letters (`I7PUMPR0Yhdw`, `NFse7Liwuic2`) are random-name noise even with few case flips
+		-- (5 flips are enough when they are dense: 5 in 12 letters, `qjwqDriBPzMZ`)
+		-- (a word-like stretch only counts against the name when the case flips are sparse: `oofqqZyLzSmQ`)
+		local dense = flips >= 5 and flips * 5 >= #k * 2
+		c = c and not (word and not dense)
+			and (flips >= 6 or dense or (flips >= 3 and digits >= 1) or (flips >= 1 and digits >= 2))
 		if c and __ROBLOX and (R.find(__ROBLOX.enums, k, 1, true) or R.find(__ROBLOX.classes, k, 1, true)) then c = false end
 	end
 	CHAIN.canaries[k] = c

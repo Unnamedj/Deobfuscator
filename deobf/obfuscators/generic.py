@@ -14,6 +14,8 @@ class Generic(Obfuscator):
     name = "generic"
     label = "unknown obfuscator (behaviour trace only)"
     doc = ""
+    # runtime config (envlog.luau CFG) a subclass wants on by default; --cfg still wins
+    cfg_defaults = {}
 
     def detect(self, source):
         return 0.01
@@ -22,7 +24,7 @@ class Generic(Obfuscator):
         args = job.args
         cache_path = harness.load_p2d_cache(job.input, args.studio)
         runner = harness.Runner(job)
-        cfg = harness.user_cfg(args, harness.base_cfg(args))
+        cfg = harness.user_cfg(args, dict(harness.base_cfg(args), **self.cfg_defaults))
         print("[*] tracing %s..." % job.input, file=sys.stderr)
         body, err = runner.run(job.source, cfg)
         if body is None:

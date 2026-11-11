@@ -11,6 +11,7 @@ from obfuscators.luraph_v15 import LuraphV15
 from obfuscators.ironbrew1 import Ironbrew1
 from obfuscators.zeus import Zeus
 from obfuscators.hydra import Hydra
+from obfuscators.voltils import Voltils
 from obfuscators.generic import Generic
 
 PLUGINS = [
@@ -18,6 +19,7 @@ PLUGINS = [
     Ironbrew1(),
     Zeus(),
     Hydra(),
+    Voltils(),
     Generic(),      # fallback: behaviour trace only
 ]
 

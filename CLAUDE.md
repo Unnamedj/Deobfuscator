@@ -34,6 +34,7 @@ there, never here; this file only holds what all plugins share.
 | `ironbrew1` | `IRONBREW1.md` | Devirtualizer + trace. Samples: `*-ib1.lua` (all with sources). |
 | `zeus` | `ZEUS.md` | Static devirtualizer (state-machine dispatcher); the script is never run. |
 | `hydra` | `HYDRA.md` | Loadstring packer layers: peeled, inner payload goes to its plugin. |
+| `voltils` | `VOLTILS.md` | Trace only (`frame_pump` on). |
 | `generic` | (none) | Fallback for undetected inputs: behaviour trace only. |
 
 ## Folder layout
@@ -64,9 +65,10 @@ sit in the plugin's folder (Luraph's `options.txt`).
 - `deobf/research/`: shared check scripts, fingerprint scripts, Path2D data,
   `obfuscate.py` (test-sample generator: makes original+obfuscated pairs to test the
   deobfuscator; semantics-preserving, `--check` proves it; `OBFUSCATOR.md`).
-- `deobf/bin/`: `luau.exe`, `luau-ast.exe` (downloaded if missing). `luau.exe`
-  is **built by `build_luau.py`** (Luau 0.739, vector metatable left writable,
-  see Environment fidelity); a downloaded stock one lacks the Vector3 members.
+- `deobf/bin/`: `luau(.exe)`, `luau-ast(.exe)`: **built by `build_luau.py`** (Luau 0.739;
+  patches: vector metatable left writable, see Environment fidelity; `%s` in `string.format`
+  takes a userdata with `__tostring`: stand-ins can't be intercepted from Lua, the string
+  metatable is frozen). Stock builds lack both; on Linux nothing is downloaded, build it.
   gcc build uses `-march=native` (faster than the official binary): rebuild
   per machine, or `--portable` for a copy that runs elsewhere (the bot server).
 
@@ -295,8 +297,9 @@ hold for every change to the shared runtime:
     Path2D with invalid parent".
   - Unknown globals are proxies, except hash-like names (`_<12+ hex digits>`) and
     canaries (`CHAIN.canary`: `o.mmQ8sBTylJYLo`, random alphanumerics, 11+ long, short
-    or vowel-less lowercase runs, many case flips, not in the API data): nil. VMs read them to get a free
-    nil (loop exit); a proxy made one die with "arithmetic on number and nil".
+    or vowel-less lowercase runs, many case flips or 2+ digits, not in the API data): nil. VMs read them
+    for a free nil; a proxy made one die with "arithmetic on number and nil".
+  - `--cfg frame_pump=true` (voltils): frame-signal handlers run once per `task.wait`; off by default (Luraph's run after the script).
   - `getgenv()/_G/shared` are real tables (first writes logged via a hidden `__newindex`, `getmetatable` returns nil). Writes to keys that already exist bypass `__newindex`: `CHAIN.syncGenv` diffs a shadow copy before every emitted statement (and at the end) and logs them (`_G.x = false` ... `_G.x = true`).
 - **Script-level checks** (not the obfuscator's; diaz.txt, Script42.lua): `isfunctionhooked` must
   return false (a truthy stand-in runs the script's `LPH_CRASH()` spin),

@@ -1,6 +1,10 @@
 """
-Builds bin/luau(.exe) from Luau source with one patch: the vector type's
-metatable is left writable (stock Luau freezes it in lveclib.cpp).
+Builds bin/luau(.exe) and bin/luau-ast(.exe) from Luau source with two patches:
+1. the vector type's metatable is left writable (stock Luau freezes it in lveclib.cpp);
+2. `%s` in string.format accepts a userdata that has `__tostring` (lstrlib.cpp). The fake
+   Roblox environment's stand-ins for unknown game values are such userdata; the string
+   metatable is frozen, so `("%s"):format(x)` cannot be intercepted from Lua. Stock Luau
+   raises "string expected, got userdata" there, which the real game's string values never do.
 
 In Roblox, Vector3 *is* the native vector type and the engine gives it a
 metatable with the Vector3 members (Magnitude, Unit, Dot, Cross, Lerp, ...).
@@ -32,7 +36,33 @@ def run(cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
+FORMAT_S = "                size_t l;\n                const char* s = luaL_checklstring(L, arg, &l);\n"
+FORMAT_S_PATCHED = (
+    "                size_t l;\n"
+    "                // deobf: a userdata with __tostring formats like tostring() (stand-ins for unknown values)\n"
+    "                if (lua_type(L, arg) == LUA_TUSERDATA && luaL_getmetafield(L, arg, \"__tostring\"))\n"
+    "                {\n"
+    "                    lua_pop(L, 1);\n"
+    "                    luaL_tolstring(L, arg, NULL);\n"
+    "                    lua_replace(L, arg);\n"
+    "                }\n"
+    "                const char* s = luaL_checklstring(L, arg, &l);\n")
+
+
+def patch_format(src):
+    path = os.path.join(src, "VM", "src", "lstrlib.cpp")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if FORMAT_S_PATCHED in text:
+        return
+    if text.count(FORMAT_S) != 1:
+        sys.exit("[!] lstrlib.cpp changed upstream: patch str_format() case 's' by hand")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text.replace(FORMAT_S, FORMAT_S_PATCHED))
+
+
 def patch(src):
+    patch_format(src)
     path = os.path.join(src, "VM", "src", "lveclib.cpp")
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -73,17 +103,19 @@ def main():
                 "-DCMAKE_CXX_FLAGS_RELEASE=%s -DNDEBUG" % opt,
                 "-DCMAKE_EXE_LINKER_FLAGS=-static " + opt]
     run(cfg)
+    # luau (runs the harnesses) and luau-ast (the lifters' parser: names.py, localfuncs.py, checks)
     run(["cmake", "--build", build, "--config", "Release", "--target", "Luau.Repl.CLI",
-         "--parallel"])
-    exe = "luau.exe" if os.name == "nt" else "luau"
-    for cand in (os.path.join(build, "Release", exe), os.path.join(build, exe)):
-        if os.path.exists(cand):
-            os.makedirs(BIN, exist_ok=True)
-            shutil.copy2(cand, os.path.join(BIN, exe))
-            print("[+] wrote " + os.path.join(BIN, exe), file=sys.stderr)
-            break
-    else:
-        sys.exit("[!] built binary not found under " + build)
+         "Luau.Ast.CLI", "--parallel"])
+    suffix = ".exe" if os.name == "nt" else ""
+    for exe in ("luau" + suffix, "luau-ast" + suffix):
+        for cand in (os.path.join(build, "Release", exe), os.path.join(build, exe)):
+            if os.path.exists(cand):
+                os.makedirs(BIN, exist_ok=True)
+                shutil.copy2(cand, os.path.join(BIN, exe))
+                print("[+] wrote " + os.path.join(BIN, exe), file=sys.stderr)
+                break
+        else:
+            sys.exit("[!] built binary %s not found under %s" % (exe, build))
     if tmp:
         shutil.rmtree(tmp, ignore_errors=True)
 
